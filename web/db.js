@@ -1,15 +1,18 @@
 /** Closet data stays in IndexedDB on this device. */
 
 const DB_NAME = "my-digital-closet";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
+const STORES = ["items", "outfits", "garments", "scans", "queue", "inbox", "prefs"];
 
 function openDb() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
     request.onupgradeneeded = () => {
       const db = request.result;
-      for (const name of ["items", "outfits", "garments", "scans"]) {
-        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: name === "scans" ? "key" : "id" });
+      for (const name of STORES) {
+        if (db.objectStoreNames.contains(name)) continue;
+        const keyPath = name === "items" || name === "outfits" || name === "garments" ? "id" : name === "prefs" ? "id" : "key";
+        db.createObjectStore(name, { keyPath });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -45,6 +48,10 @@ export function readAll(name) {
   return withStore(name, "readonly", (store) => requestToPromise(store.getAll()));
 }
 
+export function getRecord(name, key) {
+  return withStore(name, "readonly", (store) => requestToPromise(store.get(key)));
+}
+
 export function putRecord(name, record) {
   return withStore(name, "readwrite", (store) => requestToPromise(store.put(record)));
 }
@@ -58,11 +65,29 @@ export function clearStore(name) {
 }
 
 export async function loadCloset() {
-  const [items, outfits, garments, scans] = await Promise.all([
+  const [items, outfits, garments, scans, queue, prefs] = await Promise.all([
     readAll("items"),
     readAll("outfits"),
     readAll("garments"),
     readAll("scans"),
+    readAll("queue"),
+    readAll("prefs"),
   ]);
-  return { items, outfits, garments, scans };
+  return { items, outfits, garments, scans, queue, prefs };
+}
+
+export async function writeInbox(key, file) {
+  const blob = file instanceof Blob ? file : new Blob([await file.arrayBuffer()]);
+  await putRecord("inbox", { key, blob, name: file.name || "photo.jpg", type: blob.type || "image/jpeg" });
+}
+
+export async function readInbox(key, lastModified = Date.now()) {
+  const row = await getRecord("inbox", key);
+  if (!row?.blob) return null;
+  return new File([row.blob], row.name || "photo.jpg", { type: row.type || "image/jpeg", lastModified });
+}
+
+export async function inboxHas(key) {
+  const row = await getRecord("inbox", key);
+  return Boolean(row?.blob);
 }

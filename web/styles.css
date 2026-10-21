@@ -182,6 +182,8 @@ input, select {
 
 .link { color: #24382d; }
 
+.check { display: flex; gap: 0.65rem; align-items: flex-start; }
+.check input { width: 1.15rem; min-height: 1.15rem; margin-top: 0.2rem; }
 .file input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 .file { display: block; text-align: center; }
 

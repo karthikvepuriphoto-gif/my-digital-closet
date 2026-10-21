@@ -1,4 +1,4 @@
-const CACHE = "closet-shell-v3";
+const CACHE = "closet-shell-v4";
 const SHELL = [
   "./",
   "./index.html",
@@ -8,6 +8,9 @@ const SHELL = [
   "./closet.js",
   "./db.js",
   "./vision.js",
+  "./runner.js",
+  "./scan-session.js",
+  "./native-scan.js",
   "./favicon.ico",
   "./manifest.webmanifest",
   "./icons/icon-192.png",

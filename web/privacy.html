@@ -13,14 +13,14 @@
     <h1>Your closet stays on this phone</h1>
     <p>My Digital Closet does not have an account, a closet server, or an ad network. Pieces, outfits, and photos are saved in this browser, on this device, using the browser’s private storage (IndexedDB). Clearing the site data, or deleting the home-screen app, removes that closet from the device.</p>
     <h2>Photos</h2>
-    <p>You pick pictures with the phone’s file picker, a folder picker, or the camera. The app reads those files to find clothes. It does not upload them, does not send them to a vision service, and does not change the originals. Crops are saved in the same private storage. A zip you download, or a folder you pick with the file-system prompt, is written only because you asked for it.</p>
+    <p>You pick pictures with the phone’s file picker, a folder picker, or the camera. The app reads those files to find clothes. It does not upload them, does not send them to a vision service, and does not change the originals. While a photo is waiting, the app keeps a private copy in on-device storage so a scan can continue after you leave. That copy is deleted when the photo finishes. Crops you approve stay in the same private storage. A zip you download, or a folder you pick with the file-system prompt, is written only because you asked for it.</p>
     <h2>The clothing model</h2>
     <p>The first time you scan, the app downloads two open models into this browser’s cache: a small clothing segmenter (SegFormer B0 clothes, about 4 MB) and a small comparison model (DINOv2 small, about 15 MB). That download is a normal file download from the model host. Your photos are not part of the request. Later scans use the cached copies and run on the phone, even if you are offline. The app does not turn on usage telemetry for those tools.</p>
     <p>Opening the closet, adding a piece, or building an outfit does not download the models and does not contact that host.</p>
     <h2>What we don’t collect</h2>
     <p>There is no analytics, no account, and no list of your clothes anywhere except on your device. The person who published this copy of the app cannot see your wardrobe.</p>
     <h2>The Play listing</h2>
-    <p>If you installed this from Google Play, the Android package is a window onto this same site. It does not add a second server. Play’s own account is Google’s, not this app’s. The privacy policy for the listing is this page.</p>
+    <p>If you installed this from Google Play, the Android app is these same pages packaged on the phone, plus a notification while a scan is running. The notification is there so Android lets the scan finish when the app is not on screen. It does not send the photos anywhere. You can choose to scan only while the phone is charging. The screen-on switch only keeps this phone’s screen awake during a scan. Play’s own account is Google’s, not this app’s. The privacy policy for the listing is this page.</p>
     <p><a class="link" href="./">Back to the closet</a></p>
   </article>
 </body>

@@ -4,7 +4,7 @@ A private wardrobe you can open from a link on an iPhone or an Android phone, an
 
 ## Use it on a phone
 
-Open the site in Chrome or Safari. The address is the link you publish with the steps below. That link is the app. The Play listing, further down, is separate and needs the site to be on HTTPS first.
+Open the site in Chrome or Safari. The address is the link you publish with the steps below. That link is the app. The Play build, further down, is a separate Android package of these same pages.
 
 - **Android:** the browser offers **Install**, or you can use the menu and choose **Add to Home screen** or **Install app**. That uses the site as an app. No Play Store is required for this step.
 - **iPhone:** tap **Share**, then **Add to Home Screen**. iOS does not show the Android install button. The home-screen icon opens the same app.
@@ -18,9 +18,17 @@ Open **Import**. Choose photos, a folder (Chrome on Android and on a computer), 
 - [SegFormer B0 clothes](https://huggingface.co/Xenova/segformer_b0_clothes) (quantized, about 4 MB) finds a person and cuts out each garment. It is the small, phone-sized version of the same kind of model the computer app uses.
 - [DINOv2 small](https://huggingface.co/Xenova/dinov2-small) (4-bit, about 15 MB) turns each crop into a signature so the same piece in another photo can be recognized. If that small file cannot load, the app tries the next size (about 24 MB).
 
-That download is the model files only. The photos are not part of the request, and they are not sent to a vision API. Later scans use the cached models and run on the phone. **Scan next 4** is the comfortable batch. Stop whenever you want. Pick the same folder again later and photos that are unchanged (same name, size, and modified time) are skipped.
+That download is the model files only. The photos are not part of the request, and they are not sent to a vision API. Later scans use the cached models and run on the phone.
 
-Nothing is added until you approve it. You can fix the name, category, color, and season first. A dress is stored as **Full Body** so a look can treat it as a one-piece, and its crop file goes in `dresses/`. The segmenter has no coat class, so a long top is only a suggestion of outerwear. Rejecting a guess drops the crop and remembers the signature. It does not delete the original photo, because the app never has permission to change files you did not pick as a save destination.
+The scan is built to run slowly and to keep what it has already finished:
+
+- Each photo is saved in the on-device queue before the next one starts. A private copy of a picked photo is kept until that photo finishes, then the copy is deleted. The original file is never changed.
+- **Scan next 4** does a short batch. **Scan all remaining** keeps going. **Stop after this photo** finishes the one in progress and leaves the rest queued.
+- There is a short pause between photos so the phone can cool down. **Only scan while charging** waits when the phone is unplugged. Chrome and the Play app can see the charger. iPhone’s browser cannot, so that switch does not block a scan in Safari.
+- **Keep the screen on during the scan** uses the screen wake lock while the app is open. It is off unless you turn it on.
+- If the page is closed mid-scan, opening it again continues from the last finished photo. On iPhone the system pauses work in the background; the checkpoint is what makes it continue. Finished photos are not scanned again.
+
+Nothing is added to the closet until you approve it. You can fix the name, category, color, and season first. A dress is stored as **Full Body** so a look can treat it as a one-piece, and its crop file goes in `dresses/`. The segmenter has no coat class, so a long top is only a suggestion of outerwear. Rejecting a guess drops the crop and remembers the signature. It does not delete the original photo, because the app never has permission to change files you did not pick as a save destination.
 
 **Download crops (.zip)** saves approved photos in folders named `tops`, `bottoms`, `dresses`, `outerwear`, `shoes`, and `accessories`. In Chrome, **Save crops to a folder** writes those same folders into a directory you choose. Safari on iPhone can use the zip.
 
@@ -74,7 +82,7 @@ The site is the `web/` folder. It has no build step and no server. Any static ho
 
 ### Cloudflare Pages
 
-This is the better host if you also want Google Play, because Play has to read a file at `https://YOUR-HOST/.well-known/assetlinks.json`. That file is already in `web/.well-known/`.
+Use this when you want a link to send people. The Play app, further down, packages the same pages inside an Android app and does not need this host to keep running.
 
 1. Create a free [Cloudflare Pages](https://pages.cloudflare.com/) project.
 2. Upload the contents of `web/` as the site root, or connect this GitHub repo and set the root directory to `web`.
@@ -87,36 +95,44 @@ This is the better host if you also want Google Play, because Play has to read a
 3. Deploy from a branch. Use a branch whose root is the contents of `web/` (the `gh-pages` branch is the usual name), or set the site to serve the `web` folder if GitHub offers that.
 4. The link looks like `https://YOUR-USER.github.io/my-digital-closet/`.
 
-A project site on `github.io` cannot place `assetlinks.json` on the bare domain. That is fine for the installable link and for iPhone. For Play, use Cloudflare Pages, a custom domain, or a GitHub user site where this app is the whole site and `assetlinks.json` is at the host root.
+A project site on `github.io` is enough for the installable link and for iPhone.
 
 ## Google Play
 
-The Play package is a [Trusted Web Activity](https://developer.chrome.com/docs/android/trusted-web-activity/) made with [Bubblewrap](https://github.com/GoogleChromeLabs/bubblewrap). It is a thin Android window around the same site, not a second copy of the closet and not a place where photos are processed. Capacitor would wrap the files inside an app binary. Bubblewrap fits better here because the link, the home-screen app, and the Play app are one site.
+The Play build is a [Capacitor](https://capacitorjs.com/) app. The same `web/` pages run inside an Android WebView, and a foreground service keeps a scan going when the app is not on screen. A Trusted Web Activity cannot do that: it is a Chrome window, and Chrome will not keep running the page’s work with a foreground service after you leave. The package id is `gif.photo.mydigitalcloset`. It cannot be changed after the first upload.
 
-You need the site live on HTTPS first, with the manifest at `/manifest.webmanifest`.
+The service shows a progress notification (“Scanning 3 of 40”). It holds a partial wake lock only while a photo is actually being scanned, and lets the CPU sleep when the scan is waiting for the charger. Between photos the app waits a couple of seconds. If Android reports the phone is hot, the scan pauses and the notification says so. **Only scan while charging** is the option for battery and heat. Leaving with the Home button keeps the scan running. Swiping the app away stops the process; opening it again continues from the last finished photo. The photo that was in progress is retried. Finished photos are not lost.
+
+`web/.well-known/assetlinks.json` is not used by this Play build. It would only matter for a Trusted Web Activity.
 
 1. Pay the one-time **$25** [Play Console registration fee](https://play.google.com/console/signup) and finish identity verification. Google sometimes holds new accounts for a few days.
-2. Install the helper and Java (Bubblewrap asks for a JDK):
+2. Install a JDK, Android Studio (or the command-line SDK), and the repo dependencies:
 
    ```bash
-   npm install -g @bubblewrap/cli
-   bubblewrap init --manifest=https://YOUR-HOST/manifest.webmanifest
+   npm install
+   npx cap sync android
    ```
 
-   `init` writes an Android project and a signing keystore. The starting point checked into this repo is [`play/twa-manifest.json`](play/twa-manifest.json). Replace `REPLACE_WITH_YOUR_HOST` before you rely on that file, and keep the package id (`gif.photo.mydigitalcloset`) unless you are sure you will never ship it. The package id cannot be changed after the first upload.
+   The Android project is already in `android/`. `npx cap sync android` copies `web/` into it. You need that after any change to the pages.
 
-3. **Signing.** Bubblewrap creates `android.keystore`. Back it up somewhere that is not the git repo. Losing it before Play App Signing is turned on means you cannot update the app. Build the bundle:
+3. **Signing.** Create an upload keystore and do not commit it:
 
    ```bash
-   bubblewrap build
+   keytool -genkeypair -v -keystore closet-upload.keystore -alias closet -keyalg RSA -keysize 2048 -validity 10000
    ```
 
-   Upload the `.aab` to Play. Turn on **Play App Signing**. Play then holds the app signing key and you keep the upload key. You can see the certificates under **Play Console → App integrity**.
+   Copy `keystore.properties.example` to `keystore.properties` and fill in the passwords and the path to the keystore. Back up the keystore somewhere that is not the git repo. Losing it before Play App Signing is turned on means you cannot update the app. Build the bundle:
 
-4. **Digital Asset Links.** The installed Play app is allowed to open your site full-screen only if `https://YOUR-HOST/.well-known/assetlinks.json` lists the app. Put the SHA-256 of the **Play app signing certificate** into [`web/.well-known/assetlinks.json`](web/.well-known/assetlinks.json), deploy the site again, and check it in [Google’s statement list tester](https://developers.google.com/digital-asset-links/tools/generator). A local upload-key fingerprint is not enough once Play App Signing is on.
+   ```bash
+   cd android && ./gradlew bundleRelease
+   ```
 
-5. **Store listing.** Use the phone screenshots, the short description, and the privacy policy URL `https://YOUR-HOST/privacy.html`. In the **Data safety** form, say the app collects nothing and shares nothing: the wardrobe is stored on the device by the browser, and the developer’s servers do not receive it.
+   The bundle is `android/app/build/outputs/bundle/release/app-release.aab`. Upload it to Play. Turn on **Play App Signing**. Play then holds the app signing key and you keep the upload key. Certificates are under **Play Console → App integrity**.
 
-6. **Closed test, then production.** New personal Play accounts have to run a closed test before production access is granted. Create a closed testing track, add at least **12 testers**, and have them opt in and install the app. Google asks that this track stay in good standing for **14 days**. After that, apply for production. The exact checklist is in Play Console and Google does change it, so read the banner in the console before you rely on the numbers.
+4. **Store listing.** Use the phone screenshots, the short description, and the privacy policy URL. That page is `web/privacy.html` on the public site, for example `https://YOUR-HOST/privacy.html`. In the **Data safety** form, say the app collects nothing and shares nothing. The wardrobe stays on the device. The notification exists only so Android can keep a scan running. Declare the foreground service type as data sync: the user started a scan of photos already on the phone.
 
-The computer app does not go through Play. Only the site does.
+5. **Closed test, then production.** New personal Play accounts have to run a closed test before production access is granted. Create a closed testing track, add at least **12 testers**, and have them opt in and install the app. Google asks that this track stay in good standing for **14 days**. After that, apply for production. The exact checklist is in Play Console and Google does change it, so read the banner in the console before you rely on the numbers.
+
+The computer app does not go through Play. The link from the section above does not go through Play either. Only this Android bundle does.
+
+On the computer, photo import already resumes. `python photo_import.py scan` records each finished picture and skips it the next time.

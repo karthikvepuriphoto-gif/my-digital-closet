@@ -7,9 +7,7 @@ import {
   basename,
   closetSummary,
   countBy,
-  fileKey,
   filterItems,
-  findDuplicate,
   itemsFromCsv,
   itemsToCsv,
   nextItemId,
@@ -23,7 +21,8 @@ import {
   validateOutfit,
 } from "./closet.js";
 import { clearStore, deleteRecord, loadCloset, putRecord } from "./db.js";
-import { ensureModels, findGarments } from "./vision.js";
+import { bindRunner } from "./runner.js";
+import { describeProgress } from "./scan-session.js";
 
 const state = {
   items: [],
@@ -47,7 +46,20 @@ const state = {
   removeId: null,
   installEvent: null,
   installDismissed: readInstallDismissed(),
+  queue: [],
+  job: null,
+  onlyWhileCharging: false,
+  keepAwake: false,
+  stopPowerWait: null,
 };
+
+const runner = bindRunner({
+  state,
+  render: () => render(),
+  flash: (kind, text) => flash(kind, text),
+  saveItem: (item) => saveItem(item),
+  saveGarment: (garment) => saveGarment(garment),
+});
 
 const urls = new Map();
 
@@ -262,11 +274,15 @@ function pendingGarments() {
 }
 
 function renderImport() {
-  const scanned = new Set(state.scans.map((scan) => scan.key));
-  const waiting = state.files.filter((file) => !scanned.has(fileKey(file))).length;
   const pending = pendingGarments();
   const approved = state.garments.filter((garment) => garment.status === "approved").length;
-  const failed = state.scans.filter((scan) => scan.error).length;
+  const failed = state.queue.filter((entry) => entry.status === "error").length;
+  const progress = describeProgress(state.queue);
+  const needs = state.queue.filter((entry) => entry.status === "needs-file").length;
+  const waiting = state.queue.filter((entry) => entry.status === "queued" || entry.status === "reading").length;
+  const folderPick = "showDirectoryPicker" in window
+    ? `<button type="button" data-action="pick-folder">Choose a folder</button>`
+    : `<label class="file button">Choose a folder<input id="pick-folder" type="file" accept="image/*" multiple webkitdirectory></label>`;
   const folderButton = "showDirectoryPicker" in window
     ? `<button type="button" data-action="save-folder">Save crops to a folder</button>`
     : `<p class="hint">This browser can download a zip of the crops. Saving straight into a folder is available in Chrome on Android and on a computer.</p>`;
@@ -291,21 +307,27 @@ function renderImport() {
   return `
     ${banner()}
     <h2>Import from photos</h2>
-    <p class="lede">Pick pictures already on this phone. Suggestions stay here until you approve them.</p>
-    <div class="banner ok">Your pictures stay on this phone. The scan only reads them. It does not upload them or send them to a cloud service. The clothing model is downloaded once into this browser, then runs here. Nothing is added until you approve it. <a class="link" href="./privacy.html">Privacy</a></div>
+    <p class="lede">Pick pictures already on this phone. The scan saves each finished photo before the next one, so leaving the app does not throw that work away.</p>
+    <div class="banner ok">Your pictures stay on this phone. The scan only reads them. It does not upload them. A private copy is kept until that photo is finished, then the copy is removed. The original is never changed. <a class="link" href="./privacy.html">Privacy</a></div>
     <div class="stack">
       <label class="file button">Choose photos<input id="pick-photos" type="file" accept="image/*" multiple></label>
-      <label class="file button">Choose a folder<input id="pick-folder" type="file" accept="image/*" multiple webkitdirectory></label>
+      ${folderPick}
       <label class="file button">Take a photo<input id="pick-camera" type="file" accept="image/*" capture="environment"></label>
     </div>
-    <p class="hint">${state.files.length} photo${state.files.length === 1 ? "" : "s"} chosen · ${waiting} waiting · ${pending.length} to review · ${approved} approved</p>
+    <label class="check"><input id="opt-charging" type="checkbox" ${state.onlyWhileCharging ? "checked" : ""}> Only scan while charging</label>
+    <p class="hint">When this is on, the scan waits if the phone is unplugged. iPhone’s browser cannot see the charger, so this applies in Chrome and in the Play app. Each photo still waits a moment before the next one, so the phone can cool down.</p>
+    <label class="check"><input id="opt-awake" type="checkbox" ${state.keepAwake ? "checked" : ""}> Keep the screen on during the scan</label>
+    <p class="hint">${progress.total ? `${escapeHtml(progress.label)}` : "No photos queued yet"} · ${pending.length} to review · ${approved} approved${waiting ? ` · ${waiting} still to do` : ""}</p>
+    ${needs ? `<p class="hint">${needs} photo${needs === 1 ? "" : "s"} need to be chosen again. Finished photos stay finished.</p>` : ""}
     ${failed ? `<p class="hint">${failed} photo${failed === 1 ? "" : "s"} could not be read. The rest can still be scanned.</p>` : ""}
-    ${state.progress ? `<p class="hint">${escapeHtml(state.progress)}</p><div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(state.progressValue * 100)}"><span style="width:${state.progressValue * 100}%"></span></div>` : ""}
+    ${state.progress ? `<p class="hint" role="status">${escapeHtml(state.progress)}</p><div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round((state.progressValue || 0) * 100)}"><span style="width:${(state.progressValue || 0) * 100}%"></span></div>` : ""}
+    <p class="hint">${runner.inPlayApp() ? "On this Play app, the scan keeps going when you leave the screen and shows a notification with the count." : "Finished photos stay saved if you leave. On iPhone, the scan pauses in the background and continues when you open the app again."}</p>
     <div class="row">
       <button class="primary" type="button" data-action="scan" data-limit="4" ${state.scanning ? "disabled" : ""}>Scan next 4</button>
       <button type="button" data-action="scan" ${state.scanning ? "disabled" : ""}>Scan all remaining</button>
     </div>
     ${state.scanning ? `<button type="button" data-action="stop-scan">Stop after this photo</button>` : ""}
+    ${waiting && !state.scanning ? `<button type="button" data-action="clear-unfinished">Remove unfinished photos</button>` : ""}
     <h2>Review</h2>
     <p class="lede">Approve a piece to add it. Reject it and only the crop is discarded.</p>
     ${pending.length ? `<button type="button" data-action="approve-all">Approve all as suggested</button>${cards}` : `<div class="empty"><h2>Nothing waiting for review</h2><p>Choose a few photos. The originals are not moved.</p></div>`}
@@ -360,7 +382,8 @@ function render() {
   const active = document.activeElement;
   const activeId = active?.id;
   const caret = active && "selectionStart" in active ? active.selectionStart : null;
-  document.querySelector("#counts").textContent = `${word(state.items.length, "piece", "pieces")} · ${word(state.outfits.length, "look", "looks")}`;
+  const tally = `${word(state.items.length, "piece", "pieces")} · ${word(state.outfits.length, "look", "looks")}`;
+  document.querySelector("#counts").textContent = state.progress ? state.progress : tally;
   document.querySelector("#screen").innerHTML = (views[state.screen] || renderCloset)();
   for (const link of document.querySelectorAll(".tabbar a")) {
     const on = link.getAttribute("href") === `#${state.screen}`;
@@ -424,24 +447,6 @@ function optionalId(value) {
   if (!value) return null;
   const number = Number(value);
   return Number.isInteger(number) ? number : null;
-}
-
-function imageFile(file) {
-  return file && /\.(jpe?g|png|webp|bmp)$/i.test(file.name) && !file.name.startsWith(".");
-}
-
-function rememberFiles(list) {
-  const seen = new Set(state.files.map(fileKey));
-  let added = 0;
-  for (const file of list) {
-    if (!imageFile(file)) continue;
-    const key = fileKey(file);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    state.files.push(file);
-    added += 1;
-  }
-  return added;
 }
 
 async function onAdd(form) {
@@ -582,98 +587,6 @@ async function rejectGarment(id) {
   await saveGarment({ ...garment, status: "rejected", cropBlob: null });
   flash("ok", "Rejected. The original photo was left where it is.");
   render();
-}
-
-async function scan(limit) {
-  if (state.scanning) return;
-  const scanned = new Set(state.scans.map((scan) => scan.key));
-  const queue = state.files.filter((file) => !scanned.has(fileKey(file)));
-  const batch = limit ? queue.slice(0, limit) : queue;
-  if (!batch.length) {
-    flash("ok", state.files.length ? "No new photos to scan. Unchanged pictures are left as they are." : "Choose the photos or the folder first.");
-    render();
-    return;
-  }
-  state.scanning = true;
-  state.stopScan = false;
-  state.flash = null;
-  state.progress = "Getting the on-device models ready. Photos stay on this phone.";
-  state.progressValue = 0;
-  render();
-  let found = 0;
-  try {
-    await ensureModels((update) => {
-      if (update.status !== "progress") return;
-      const ratio = update.total ? update.loaded / update.total : update.progress || 0;
-      state.progress = `Downloading the ${update.which || "model"} (${Math.round(ratio * 100)}%). Your photos are not in this download.`;
-      state.progressValue = ratio;
-      render();
-    });
-    for (let index = 0; index < batch.length; index += 1) {
-      if (state.stopScan) break;
-      const file = batch[index];
-      const key = fileKey(file);
-      state.progress = `Scanning ${index + 1} of ${batch.length}: ${file.name}`;
-      state.progressValue = index / batch.length;
-      render();
-      let error = "";
-      const garmentIds = [];
-      try {
-        const before = `${file.size}:${file.lastModified}`;
-        const regions = await findGarments(file);
-        if (`${file.size}:${file.lastModified}` !== before) {
-          throw new Error(`${file.name} changed while it was being read. Stopped.`);
-        }
-        for (const region of regions) {
-          const match = findDuplicate(state.garments, region.category, region.embedding);
-          if (match) {
-            const sources = match.sourceNames || [];
-            if (!sources.includes(file.name)) sources.push(file.name);
-            match.sourceNames = sources;
-            await saveGarment(match);
-            if (match.closetId) {
-              const linked = state.items.find((item) => item.id === match.closetId);
-              if (linked) {
-                linked.sourcePhoto = sources[0] || linked.sourcePhoto;
-                linked.sourcePhotos = sources.join("|");
-                await saveItem(linked);
-              }
-            }
-            garmentIds.push(match.id);
-          } else {
-            const garment = {
-              id: crypto.randomUUID(),
-              status: "pending",
-              sourceName: file.name,
-              sourceNames: [file.name],
-              created: new Date().toISOString(),
-              closetId: null,
-              ...region,
-            };
-            await saveGarment(garment);
-            garmentIds.push(garment.id);
-            found += 1;
-          }
-        }
-      } catch (err) {
-        error = err.message || "That photo could not be read.";
-        if (error.includes("changed while")) throw err;
-      }
-      const record = { key, error, garmentIds, scannedAt: new Date().toISOString() };
-      await putRecord("scans", record);
-      const scanIndex = state.scans.findIndex((scan) => scan.key === key);
-      if (scanIndex >= 0) state.scans[scanIndex] = record;
-      else state.scans.push(record);
-    }
-    flash("ok", `Scan finished. ${word(found, "new piece", "new pieces")} to review.`);
-  } catch (error) {
-    flash("err", error.message || "The scan stopped.");
-  } finally {
-    state.scanning = false;
-    state.progress = "";
-    state.progressValue = 0;
-    render();
-  }
 }
 
 async function zipFiles(files) {
@@ -853,9 +766,17 @@ document.body.addEventListener("click", async (event) => {
       state.installEvent = null;
       render();
     } else if (action === "scan") {
-      await scan(button.dataset.limit ? Number(button.dataset.limit) : null);
+      await runner.start(button.dataset.limit ? Number(button.dataset.limit) : null);
     } else if (action === "stop-scan") {
-      state.stopScan = true;
+      runner.stopAfterPhoto();
+    } else if (action === "pick-folder") {
+      const result = await runner.chooseFolder();
+      if (result) flash("ok", result.added ? `Saved ${word(result.added, "photo", "photos")} on this phone.` : "Those photos were already scanned.");
+      render();
+    } else if (action === "clear-unfinished") {
+      await runner.clearUnfinished();
+      flash("ok", "Removed the unfinished photos. Finished ones stay saved.");
+      render();
     } else if (action === "approve") {
       await approveGarment(button.dataset.id);
     } else if (action === "reject") {
@@ -899,17 +820,31 @@ document.body.addEventListener("input", (event) => {
   }
 });
 
-document.body.addEventListener("change", (event) => {
+document.body.addEventListener("change", async (event) => {
   const target = event.target;
-  if (target.id === "closet-color") state.color = target.value;
-  else if (target.id === "closet-season") state.season = target.value;
-  else if (target.id === "closet-sort") state.sort = target.value;
-  else if (target.id === "pick-photos" || target.id === "pick-folder" || target.id === "pick-camera") {
-    const added = rememberFiles(target.files);
-    flash("ok", added ? `Added ${word(added, "photo", "photos")} to the scan list.` : "Those photos were already on the list.");
-    target.value = "";
-  } else return;
-  render();
+  try {
+    if (target.id === "closet-color") state.color = target.value;
+    else if (target.id === "closet-season") state.season = target.value;
+    else if (target.id === "closet-sort") state.sort = target.value;
+    else if (target.id === "opt-charging" || target.id === "opt-awake") {
+      if (target.id === "opt-charging") state.onlyWhileCharging = target.checked;
+      if (target.id === "opt-awake") state.keepAwake = target.checked;
+      if (state.keepAwake && state.scanning) await runner.holdWake();
+      await runner.saveSettings();
+      runner.notePower();
+    } else if (target.id === "pick-photos" || target.id === "pick-folder" || target.id === "pick-camera") {
+      const files = [...target.files];
+      target.value = "";
+      const result = await runner.addFiles(files);
+      flash("ok", result.added
+        ? `Saved ${word(result.added, "photo", "photos")} on this phone. Originals are untouched.`
+        : "Those photos were already scanned.");
+    } else return;
+    render();
+  } catch (error) {
+    flash("err", error.message || "That photo could not be saved on this phone.");
+    render();
+  }
 });
 
 window.addEventListener("hashchange", () => {
@@ -933,14 +868,27 @@ async function boot() {
     state.outfits = loaded.outfits;
     state.garments = loaded.garments;
     state.scans = loaded.scans;
+    state.queue = loaded.queue || [];
+    const settings = (loaded.prefs || []).find((row) => row.id === "settings");
+    const job = (loaded.prefs || []).find((row) => row.id === "job");
+    if (settings) {
+      state.onlyWhileCharging = Boolean(settings.onlyWhileCharging);
+      state.keepAwake = Boolean(settings.keepAwake);
+    }
+    if (job) state.job = job;
   } catch (error) {
     document.querySelector("#screen").innerHTML = `<div class="banner err">This browser could not open private storage, so the closet cannot be saved here. ${escapeHtml(error.message || "")}</div>`;
     return;
   }
   render();
+  runner.watchPower(() => runner.notePower());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && state.scanning && state.keepAwake) runner.holdWake();
+  });
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("./sw.js").catch(() => {});
   }
+  await runner.resumeIfNeeded();
 }
 
 boot();
