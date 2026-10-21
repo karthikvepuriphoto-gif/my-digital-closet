@@ -8,3 +8,8 @@ closet_images/
 imported_wardrobe/
 model_cache/
 *.tmp
+node_modules/
+*.keystore
+play/android/
+play/*.aab
+play/*.apk
