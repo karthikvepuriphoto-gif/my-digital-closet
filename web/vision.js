@@ -4,12 +4,15 @@
  */
 
 import {
+  dominantColor,
   labelKey,
-  nearestColor,
   regionsFromLabelMasks,
   scaledCropBox,
   suggestName,
 } from "./closet.js";
+
+const DETECT_EDGE = 640;
+const CROP_EDGE = 512;
 
 const SEGMENTER_ID = "Xenova/segformer_b0_clothes";
 const EMBEDDER_ID = "Xenova/dinov2-small";
@@ -81,16 +84,52 @@ function maskBinary(mask) {
   return { binary, width, height };
 }
 
-function fitCanvas(bitmap, maxEdge) {
-  const scale = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
-  const width = Math.max(1, Math.round(bitmap.width * scale));
-  const height = Math.max(1, Math.round(bitmap.height * scale));
+function drawingContext(canvas) {
+  try {
+    return canvas.getContext("2d", { willReadFrequently: true, colorSpace: "srgb" })
+      || canvas.getContext("2d", { willReadFrequently: true });
+  } catch {
+    return canvas.getContext("2d", { willReadFrequently: true });
+  }
+}
+
+function canvasSource(source, maxEdge) {
+  const scale = Math.min(1, maxEdge / Math.max(source.width, source.height));
+  const width = Math.max(1, Math.round(source.width * scale));
+  const height = Math.max(1, Math.round(source.height * scale));
+  if (source instanceof HTMLCanvasElement && width === source.width && height === source.height) return source;
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
-  const context = canvas.getContext("2d", { willReadFrequently: true });
-  context.drawImage(bitmap, 0, 0, width, height);
+  drawingContext(canvas).drawImage(source, 0, 0, width, height);
   return canvas;
+}
+
+async function decodePhoto(file) {
+  const options = {
+    imageOrientation: "from-image",
+    colorSpaceConversion: "default",
+    premultiplyAlpha: "none",
+  };
+  try {
+    return await createImageBitmap(file, options);
+  } catch {
+    return await createImageBitmap(file);
+  }
+}
+
+function scaleBinary(binary, srcWidth, srcHeight, dstWidth, dstHeight) {
+  if (!binary) return null;
+  if (srcWidth === dstWidth && srcHeight === dstHeight) return binary;
+  const out = new Uint8Array(dstWidth * dstHeight);
+  for (let y = 0; y < dstHeight; y += 1) {
+    const srcY = Math.min(srcHeight - 1, Math.floor((y * srcHeight) / dstHeight));
+    for (let x = 0; x < dstWidth; x += 1) {
+      const srcX = Math.min(srcWidth - 1, Math.floor((x * srcWidth) / dstWidth));
+      out[y * dstWidth + x] = binary[srcY * srcWidth + srcX];
+    }
+  }
+  return out;
 }
 
 function canvasBlob(canvas) {
@@ -108,9 +147,10 @@ async function embeddingOf(embedder, canvas) {
 
 export async function findGarments(file, onProgress) {
   const { segmenter, embedder } = await ensureModels(onProgress);
-  const decoded = await createImageBitmap(file);
-  const working = fitCanvas(decoded, 768);
-  decoded.close();
+  const decoded = await decodePhoto(file);
+  const working = canvasSource(decoded, DETECT_EDGE);
+  decoded.close?.();
+  const frame = drawingContext(working).getImageData(0, 0, working.width, working.height).data;
   const input = await canvasBlob(working);
   const masks = await segmenter(input);
   const labelMasks = masks.map((entry) => ({ label: entry.label, ...maskBinary(entry.mask) }));
@@ -131,10 +171,12 @@ export async function findGarments(file, onProgress) {
     const crop = document.createElement("canvas");
     crop.width = right - left;
     crop.height = bottom - top;
-    const context = crop.getContext("2d", { willReadFrequently: true });
-    context.drawImage(working, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
-    const pixels = context.getImageData(0, 0, crop.width, crop.height).data;
-    const color = nearestColor(pixels);
+    drawingContext(crop).drawImage(working, left, top, crop.width, crop.height, 0, 0, crop.width, crop.height);
+    const modest = canvasSource(crop, CROP_EDGE);
+    const aligned = scaleBinary(region.binary, region.maskWidth, region.maskHeight, working.width, working.height);
+    const measured = aligned
+      ? dominantColor(frame, aligned, 4)
+      : dominantColor(drawingContext(modest).getImageData(0, 0, modest.width, modest.height).data, null, 4);
     const friendly = region.friendly;
     found.push({
       label: region.label,
@@ -142,11 +184,12 @@ export async function findGarments(file, onProgress) {
       folder: region.folder,
       friendly,
       confidence: region.confidence,
-      color,
-      name: suggestName(color, friendly),
+      color: measured.name,
+      colorHex: measured.hex,
+      name: suggestName(measured.name, friendly),
       season: "All",
-      cropBlob: await canvasBlob(crop),
-      embedding: await embeddingOf(embedder, crop),
+      cropBlob: await canvasBlob(modest),
+      embedding: await embeddingOf(embedder, modest),
       note: labelKey(region.label).startsWith("upper") && region.category === "Outerwear"
         ? "Suggested as outerwear because the piece looks long. Change it if it is a shirt."
         : region.confidence < 0.6

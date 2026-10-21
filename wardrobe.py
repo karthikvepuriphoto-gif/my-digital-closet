@@ -413,10 +413,9 @@ def store_photo(data: bytes, item_id: int, root: Path) -> str:
         image.load()
     except (UnidentifiedImageError, OSError) as exc:
         raise WardrobeError("That photo could not be read. Use a JPG or PNG.") from exc
-    if image.mode == "P" and "transparency" in image.info:
-        image = image.convert("RGBA")
-    elif image.mode not in ("RGB", "RGBA"):
-        image = image.convert("RGB")
+    import photo_import as pi
+
+    image = pi.prepare_photo(image)
     image.thumbnail((1400, 1400))
     folder = root / IMAGE_DIR_NAME
     folder.mkdir(parents=True, exist_ok=True)

@@ -20,6 +20,8 @@ Open **Import**. Choose photos, a folder (Chrome on Android and on a computer), 
 
 That download is the model files only. The photos are not part of the request, and they are not sent to a vision API. Later scans use the cached models and run on the phone.
 
+Photos do not need to stay large. Each one is turned upright, converted to sRGB, and shrunk to about 640 pixels on the long side before clothes are found. Crops are saved as PNG at about 512 pixels, so a JPEG save does not shift the color. The color is measured from the garment pixels only — not the background or skin — on that 640-pixel photo, using k-means in CIELAB. You see a readable name, such as Blue, and the measured hex.
+
 The scan is built to run slowly and to keep what it has already finished:
 
 - Each photo is saved in the on-device queue before the next one starts. A private copy of a picked photo is kept until that photo finishes, then the copy is deleted. The original file is never changed.
@@ -59,7 +61,7 @@ node --test web/closet.test.js
 
 ### Computer photo import
 
-On the computer, **Import** reads a folder path. Crops go to a separate folder, never inside the photo folder. The computer models are SegFormer B2 and MobileNetV3-Small, saved in `model_cache/`. See the notes that used to live here: originals are only read, telemetry from the model tools is turned off, and a scan can be resumed.
+On the computer, **Import** reads a folder path. Crops go to a separate folder, never inside the photo folder. The computer models are SegFormer B2 and MobileNetV3-Small, saved in `model_cache/`. Originals are only read, telemetry from the model tools is turned off, and a scan can be resumed. Photos are shrunk to about 640 pixels before the model runs, crops are PNG at about 512 pixels, and the color is the garment’s measured name plus hex.
 
 ```bash
 python photo_import.py download-models

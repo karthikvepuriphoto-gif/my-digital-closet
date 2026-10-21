@@ -138,6 +138,15 @@ input, select {
   letter-spacing: -0.03em;
 }
 .card .meta { margin: 0; font-size: 0.82rem; }
+.chip {
+  display: inline-block;
+  width: 0.8rem;
+  height: 0.8rem;
+  margin-right: 0.35rem;
+  border-radius: 999px;
+  border: 1px solid rgba(34, 28, 24, 0.18);
+  vertical-align: -0.1rem;
+}
 
 .review img, .review .swatch { height: 220px; object-fit: contain; }
 .review { margin-bottom: 0.9rem; }

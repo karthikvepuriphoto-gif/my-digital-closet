@@ -68,6 +68,32 @@ COLOR_RGB = {
     "Orange": (220, 120, 40),
     "Purple": (110, 70, 150),
 }
+# Long edge before detection. Crops are saved smaller than this.
+DETECT_EDGE = 640
+CROP_EDGE = 512
+# Stride over the detection-sized photo. This is not a tiny thumbnail.
+COLOR_SAMPLES = 2500
+SKIN_LABELS = {"face", "left-arm", "right-arm", "left-leg", "right-leg"}
+_XYZ_FROM_RGB = np.array(
+    [
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041],
+    ],
+    dtype=np.float64,
+)
+_RGB_FROM_XYZ = np.array(
+    [
+        [3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660, 1.8760108, 0.0415560],
+        [0.0556434, -0.2040259, 1.0572252],
+    ],
+    dtype=np.float64,
+)
+_WHITE = np.array([0.95047, 1.0, 1.08883], dtype=np.float64)
+_LAB_DELTA = 6 / 29
+_SRGB_PROFILE: bytes | None = None
+_PALETTE_LAB: tuple[list[str], np.ndarray] | None = None
 
 
 class PhotoImportError(Exception):
@@ -82,6 +108,8 @@ class Region:
     friendly: str
     crop: Image.Image
     confidence: float
+    color: str = ""
+    color_hex: str = ""
 
 
 @dataclass
@@ -289,12 +317,17 @@ def approve_garment(
     )
     closet_id = int(items.iloc[-1]["ID"])
     sources = list(garment.get("sources") or [])
-    items = w.update_item(
-        items,
-        closet_id,
-        Source_Photo=sources[0] if sources else "",
-        Source_Photos="|".join(sources),
-    )
+    fields = {
+        "Source_Photo": sources[0] if sources else "",
+        "Source_Photos": "|".join(sources),
+    }
+    measured = str(garment.get("color") or "").strip()
+    measured_hex = str(garment.get("color_hex") or "").strip()
+    if measured_hex and color.strip() != measured:
+        measured_hex = ""
+    if measured_hex:
+        fields["Color Hex"] = measured_hex
+    items = w.update_item(items, closet_id, **fields)
     garment.update(
         {
             "status": "approved",
@@ -302,6 +335,7 @@ def approve_garment(
             "category": category,
             "folder": folder,
             "color": color,
+            "color_hex": measured_hex,
             "season": season,
             "crop_path": str(moved),
             "closet_id": closet_id,
@@ -323,16 +357,64 @@ def reject_garment(output: Path, garment_id: str) -> None:
     save_state(output, state)
 
 
+def prepare_photo(image: Image.Image) -> Image.Image:
+    """Turn the photo upright and into sRGB. The file on disk is not written."""
+    try:
+        turned = ImageOps.exif_transpose(image)
+    except (OSError, ValueError):
+        turned = image
+    converted = _to_srgb(turned)
+    if converted.mode != "RGB":
+        converted = converted.convert("RGB")
+    return converted
+
+
+def downscale(image: Image.Image, edge: int = DETECT_EDGE) -> Image.Image:
+    """Shrink the long edge before detection. Smaller photos stay as they are."""
+    if max(image.size) <= edge:
+        return image
+    copy = image.copy()
+    copy.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+    return copy
+
+
+def modest_crop(image: Image.Image) -> Image.Image:
+    if max(image.size) <= CROP_EDGE:
+        return image
+    copy = image.copy()
+    copy.thumbnail((CROP_EDGE, CROP_EDGE), Image.Resampling.LANCZOS)
+    return copy
+
+
 def nearest_color(image: Image.Image) -> str:
-    small = image.convert("RGB").resize((48, 48))
-    pixels = np.asarray(small, dtype=np.float32).reshape(-1, 3)
-    palette = list(COLOR_RGB.items())
-    counts = {name: 0 for name, _ in palette}
-    # Step through the thumbnail so a few odd pixels don't decide the color.
-    for pixel in pixels[::2]:
-        name = min(palette, key=lambda item: float(np.linalg.norm(pixel - np.array(item[1]))))[0]
-        counts[name] += 1
-    return max(counts, key=counts.get)
+    return dominant_color(image)[0]
+
+
+def dominant_color(image: Image.Image, mask: np.ndarray | None = None) -> tuple[str, str]:
+    """Name and hex for the largest color cluster in CIELAB.
+
+    Pixels come from the garment mask on the detection-sized photo. Background
+    and skin stay out of the mask. The sample is a stride across that photo,
+    not a tiny thumbnail of the whole crop.
+    """
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if mask is None:
+        chosen = rgb.reshape(-1, 3)
+    else:
+        selected = np.asarray(mask, dtype=bool)
+        if selected.shape != rgb.shape[:2]:
+            raise PhotoImportError("The color mask does not match the photo.")
+        chosen = rgb[selected]
+    if chosen.size == 0:
+        return "Grey", "#8C8C8C"
+    if len(chosen) > COLOR_SAMPLES:
+        step = int(np.ceil(len(chosen) / COLOR_SAMPLES))
+        chosen = chosen[::step]
+    lab = _rgb_to_lab(chosen.astype(np.float64))
+    centers, labels = _kmeans(lab, 3 if len(chosen) >= 24 else 1)
+    counts = np.bincount(labels, minlength=len(centers))
+    center = _lab_to_rgb(centers[int(np.argmax(counts))])
+    return _nearest_name(center), "#{:02X}{:02X}{:02X}".format(int(center[0]), int(center[1]), int(center[2]))
 
 
 def _label_key(label: str) -> str:
@@ -360,7 +442,7 @@ def classify_label(label: str, box: tuple[int, int, int, int], person_box: tuple
 
 
 def regions_from_mask(mask: np.ndarray, original: Image.Image, id2label: dict) -> list[Region]:
-    """Turn a segmentation mask into garment crops from the original photo."""
+    """Turn a segmentation mask into modest garment crops and a measured color."""
     if mask.ndim != 2:
         raise PhotoImportError("The clothing mask has the wrong shape.")
     mask_h, mask_w = mask.shape
@@ -368,6 +450,10 @@ def regions_from_mask(mask: np.ndarray, original: Image.Image, id2label: dict) -
     scale_x = orig_w / mask_w
     scale_y = orig_h / mask_h
     labels = {int(key): str(value) for key, value in id2label.items()}
+    skin = np.zeros(mask.shape, dtype=bool)
+    for label_id, name in labels.items():
+        if _label_key(name) in SKIN_LABELS:
+            skin |= mask == label_id
     person = mask > 0
     if person.any():
         ys, xs = np.where(person)
@@ -376,46 +462,55 @@ def regions_from_mask(mask: np.ndarray, original: Image.Image, id2label: dict) -
         person_box = (0, 0, mask_h, mask_w)
     min_pixels = max(400, int(0.012 * mask_h * mask_w))
     regions: list[Region] = []
-    shoe_boxes: list[tuple[str, tuple[int, int, int, int], float]] = []
+    shoes: list[tuple[str, tuple[int, int, int, int], float, np.ndarray]] = []
     for label_id, name in labels.items():
         key = _label_key(name)
         if key not in GARMENT_LABELS:
             continue
-        boxes = component_boxes(mask == label_id, min_pixels)
-        for box, _area in boxes:
-            category, folder, friendly, confidence = classify_label(name, box, person_box)
+        for box, _area, component in _components(mask == label_id, min_pixels):
             if key in {"left-shoe", "right-shoe"}:
-                shoe_boxes.append((name, box, confidence))
+                shoes.append((name, box, classify_label(name, box, person_box)[3], component))
                 continue
-            crop = _crop_original(original, box, scale_x, scale_y)
-            if crop is None:
-                continue
-            regions.append(
-                Region(name, category, folder, friendly, crop, confidence)
+            region = _region_from_component(
+                original, name, box, component, skin, scale_x, scale_y, person_box
             )
-    merged = _merge_shoe_boxes(shoe_boxes)
-    for name, box, confidence in merged:
-        crop = _crop_original(original, box, scale_x, scale_y)
-        if crop is None:
-            continue
-        category, folder, friendly, confidence = classify_label(name, box, person_box)
-        if len(merged) == 1 and len(shoe_boxes) == 2:
-            friendly = "shoes"
-        regions.append(Region(name, category, folder, friendly, crop, confidence))
+            if region is not None:
+                regions.append(region)
+    merged = _merge_shoe_boxes(shoes)
+    for name, box, _confidence, component in merged:
+        region = _region_from_component(
+            original,
+            name,
+            box,
+            component,
+            skin,
+            scale_x,
+            scale_y,
+            person_box,
+            friendly="shoes" if len(merged) == 1 and len(shoes) == 2 else None,
+        )
+        if region is not None:
+            regions.append(region)
     return regions
 
 
 def component_boxes(mask: np.ndarray, min_pixels: int) -> list[tuple[tuple[int, int, int, int], int]]:
     """Connected components as (y0, x0, y1, x1), area. y1 and x1 are exclusive."""
+    return [(box, area) for box, area, _component in _components(mask, min_pixels)]
+
+
+def _components(mask: np.ndarray, min_pixels: int) -> list[tuple[tuple[int, int, int, int], int, np.ndarray]]:
     labeled, count = _label_mask(mask.astype(bool))
-    boxes = []
+    found = []
     for label_id in range(1, count + 1):
-        ys, xs = np.where(labeled == label_id)
-        area = int(len(ys))
+        component = labeled == label_id
+        area = int(component.sum())
         if area < min_pixels:
             continue
-        boxes.append(((int(ys.min()), int(xs.min()), int(ys.max()) + 1, int(xs.max()) + 1), area))
-    return boxes
+        ys, xs = np.where(component)
+        box = (int(ys.min()), int(xs.min()), int(ys.max()) + 1, int(xs.max()) + 1)
+        found.append((box, area, component))
+    return found
 
 
 def load_state(output: Path) -> dict:
@@ -456,7 +551,10 @@ def similarity(left: list[float], right: list[float]) -> float:
 
 
 def _record_region(state: dict, output: Path, source: Path, region: Region, embedder: Embedder) -> tuple[str | None, bool]:
-    color = nearest_color(region.crop)
+    if region.color and region.color_hex:
+        color, color_hex = region.color, region.color_hex
+    else:
+        color, color_hex = dominant_color(region.crop)
     embedding = [round(float(value), 5) for value in embedder.embed(region.crop)]
     match = _find_duplicate(state, region.category, embedding)
     if match is not None:
@@ -475,6 +573,7 @@ def _record_region(state: dict, output: Path, source: Path, region: Region, embe
         "category": region.category,
         "folder": region.folder,
         "color": color,
+        "color_hex": color_hex,
         "season": "All",
         "label": region.label,
         "friendly": region.friendly,
@@ -578,7 +677,13 @@ def _save_crop(image: Image.Image, path: Path, output: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _require_inside(path, output)
     buffer = io.BytesIO()
-    image.convert("RGB").save(buffer, "PNG")
+    # PNG keeps the measured color. A JPEG round trip would shift it.
+    clean = image.convert("RGB")
+    profile = _srgb_profile()
+    if profile:
+        clean.save(buffer, "PNG", icc_profile=profile)
+    else:
+        clean.save(buffer, "PNG")
     # Write our crop only after the safety check, via a temp file in the output folder.
     temporary = path.with_name(f".{path.name}.tmp")
     _require_inside(temporary, output)
@@ -637,20 +742,22 @@ def _crop_original(original: Image.Image, box: tuple[int, int, int, int], scale_
     return original.crop((left, upper, right, lower))
 
 
-def _merge_shoe_boxes(shoes: list[tuple[str, tuple[int, int, int, int], float]]) -> list[tuple[str, tuple[int, int, int, int], float]]:
+def _merge_shoe_boxes(
+    shoes: list[tuple[str, tuple[int, int, int, int], float, np.ndarray]],
+) -> list[tuple[str, tuple[int, int, int, int], float, np.ndarray]]:
     left = [item for item in shoes if item[0].lower().startswith("left")]
     right = [item for item in shoes if item[0].lower().startswith("right")]
     if len(left) == 1 and len(right) == 1 and len(shoes) == 2:
-        _, first, first_conf = left[0]
-        _, second, second_conf = right[0]
+        _, first, first_conf, first_mask = left[0]
+        _, second, second_conf, second_mask = right[0]
         union = (
             min(first[0], second[0]),
             min(first[1], second[1]),
             max(first[2], second[2]),
             max(first[3], second[3]),
         )
-        return [("Right-shoe", union, max(first_conf, second_conf))]
-    return [(name, box, confidence) for name, box, confidence in shoes]
+        return [("Right-shoe", union, max(first_conf, second_conf), first_mask | second_mask)]
+    return list(shoes)
 
 
 def _label_mask(mask: np.ndarray) -> tuple[np.ndarray, int]:
@@ -693,9 +800,9 @@ def _label_mask(mask: np.ndarray) -> tuple[np.ndarray, int]:
 
 def _image_from_bytes(data: bytes) -> Image.Image:
     with Image.open(io.BytesIO(data)) as incoming:
-        turned = ImageOps.exif_transpose(incoming)
-        turned.load()
-        return turned.convert("RGB")
+        prepared = prepare_photo(incoming)
+        prepared.load()
+        return prepared
 
 
 def _signature(path: Path) -> tuple[int, int]:
@@ -713,6 +820,134 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _region_from_component(
+    original: Image.Image,
+    label_name: str,
+    box: tuple[int, int, int, int],
+    component: np.ndarray,
+    skin: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+    person_box: tuple[int, int, int, int],
+    friendly: str | None = None,
+) -> Region | None:
+    category, folder, guessed, confidence = classify_label(label_name, box, person_box)
+    crop = _crop_original(original, box, scale_x, scale_y)
+    if crop is None:
+        return None
+    usable = component & ~skin
+    if not np.any(usable):
+        usable = component
+    color, color_hex = dominant_color(original, _fit_mask(usable, original.size))
+    return Region(
+        label_name,
+        category,
+        folder,
+        friendly or guessed,
+        modest_crop(crop),
+        confidence,
+        color,
+        color_hex,
+    )
+
+
+def _fit_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    width, height = size
+    if mask.shape == (height, width):
+        return mask.astype(bool)
+    image = Image.fromarray(np.where(mask, np.uint8(255), np.uint8(0)), mode="L")
+    image = image.resize((width, height), Image.Resampling.NEAREST)
+    return np.asarray(image) > 127
+
+
+def _to_srgb(image: Image.Image) -> Image.Image:
+    profile = image.info.get("icc_profile")
+    if not profile:
+        return image
+    try:
+        from PIL import ImageCms
+
+        source = ImageCms.ImageCmsProfile(io.BytesIO(profile))
+        destination = ImageCms.createProfile("sRGB")
+        return ImageCms.profileToProfile(image, source, destination, outputMode="RGB")
+    except Exception:
+        return image
+
+
+def _srgb_profile() -> bytes:
+    global _SRGB_PROFILE
+    if _SRGB_PROFILE is None:
+        try:
+            from PIL import ImageCms
+
+            _SRGB_PROFILE = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+        except Exception:
+            _SRGB_PROFILE = b""
+    return _SRGB_PROFILE
+
+
+def _rgb_to_lab(pixels: np.ndarray) -> np.ndarray:
+    linear = np.where(pixels <= 10.31475, pixels / 255.0 / 12.92, ((pixels / 255.0 + 0.055) / 1.055) ** 2.4)
+    xyz = linear @ _XYZ_FROM_RGB.T
+    scaled = xyz / _WHITE
+    curved = np.where(scaled > _LAB_DELTA**3, np.cbrt(scaled), scaled / (3 * _LAB_DELTA**2) + 4 / 29)
+    lightness = 116 * curved[:, 1] - 16
+    return np.stack(
+        [lightness, 500 * (curved[:, 0] - curved[:, 1]), 200 * (curved[:, 1] - curved[:, 2])],
+        axis=1,
+    )
+
+
+def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
+    lightness, green_red, blue_yellow = (float(value) for value in lab)
+    fy = (lightness + 16) / 116
+    fx = fy + green_red / 500
+    fz = fy - blue_yellow / 200
+    curved = np.array([fx, fy, fz], dtype=np.float64)
+    scaled = np.where(curved > _LAB_DELTA, curved**3, 3 * _LAB_DELTA**2 * (curved - 4 / 29))
+    linear = (scaled * _WHITE) @ _RGB_FROM_XYZ.T
+    linear = np.clip(linear, 0, None)
+    encoded = np.where(linear <= 0.0031308, 12.92 * linear, 1.055 * np.power(linear, 1 / 2.4) - 0.055)
+    return np.clip(np.rint(encoded * 255.0), 0, 255).astype(np.int64)
+
+
+def _nearest_name(rgb: np.ndarray) -> str:
+    names, palette = _palette_lab()
+    lab = _rgb_to_lab(np.array([rgb], dtype=np.float64))[0]
+    distances = ((palette - lab) ** 2).sum(axis=1)
+    return names[int(np.argmin(distances))]
+
+
+def _palette_lab() -> tuple[list[str], np.ndarray]:
+    global _PALETTE_LAB
+    if _PALETTE_LAB is None:
+        names = list(COLOR_RGB)
+        samples = np.array([COLOR_RGB[name] for name in names], dtype=np.float64)
+        _PALETTE_LAB = (names, _rgb_to_lab(samples))
+    return _PALETTE_LAB
+
+
+def _kmeans(points: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
+    centers = [points[0].copy()]
+    while len(centers) < k:
+        stacked = np.stack(centers)
+        nearest = ((points[:, None, :] - stacked[None, :, :]) ** 2).sum(axis=2).min(axis=1)
+        index = int(np.argmax(nearest))
+        if float(nearest[index]) <= 1e-6:
+            break
+        centers.append(points[index].copy())
+    centers_array = np.stack(centers)
+    labels = np.zeros(len(points), dtype=np.int32)
+    for _ in range(12):
+        distances = ((points[:, None, :] - centers_array[None, :, :]) ** 2).sum(axis=2)
+        labels = distances.argmin(axis=1).astype(np.int32)
+        for index in range(len(centers_array)):
+            chosen = points[labels == index]
+            if len(chosen):
+                centers_array[index] = chosen.mean(axis=0)
+    return centers_array, labels
 
 
 def _cli(argv: list[str] | None = None) -> int:

@@ -1,3 +1,4 @@
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -119,6 +120,8 @@ class PhotoImportTests(unittest.TestCase):
             self.assertFalse((output / "pending" / saved.name).exists())
             self.assertEqual(items.iloc[0]["Source_Photo"], str(photo.resolve()))
             self.assertEqual(items.iloc[0]["Sub-Category"], "Red top")
+            self.assertEqual(items.iloc[0]["Primary Color"], "Red")
+            self.assertTrue(str(items.iloc[0]["Color Hex"]).startswith("#"))
             self.assertTrue(photo.is_file())
             items, outfits = w.delete_item(items, outfits, int(items.iloc[0]["ID"]), root)
             self.assertTrue(saved.is_file())
@@ -289,6 +292,11 @@ class PhotoImportTests(unittest.TestCase):
 
     def test_color_components_outerwear_and_shoes(self):
         self.assertEqual(pi.nearest_color(Image.new("RGB", (12, 12), (50, 90, 170))), "Blue")
+        name, hex_color = pi.dominant_color(Image.new("RGB", (32, 32), (50, 90, 170)))
+        self.assertEqual(name, "Blue")
+        self.assertRegex(hex_color, r"^#[0-9A-F]{6}$")
+        measured = tuple(int(hex_color[index : index + 2], 16) for index in (1, 3, 5))
+        self.assertLess(max(abs(left - right) for left, right in zip(measured, (50, 90, 170))), 3)
         mask = np.zeros((30, 40), dtype=bool)
         mask[2:10, 2:10] = True
         mask[16:28, 20:36] = True
@@ -318,6 +326,57 @@ class PhotoImportTests(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0].friendly, "shoes")
         self.assertEqual(found[0].category, "Footwear")
+
+    def test_color_uses_the_garment_and_crops_stay_modest(self):
+        image = Image.new("RGB", (90, 90), (245, 245, 245))
+        pixels = image.load()
+        for y in range(15, 75):
+            for x in range(15, 75):
+                if y < 20 or y >= 70 or x < 20 or x >= 70:
+                    pixels[x, y] = (180, 40, 40)
+        labels = np.zeros((90, 90), dtype=np.int32)
+        labels[15:75, 15:75] = 4
+        labels[20:70, 20:70] = 0
+        labels[0:18, 30:60] = 11
+        for y in range(0, 18):
+            for x in range(30, 60):
+                pixels[x, y] = (40, 110, 60)
+        regions = pi.regions_from_mask(labels, image, {4: "Upper-clothes", 11: "Face"})
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0].color, "Red")
+        self.assertTrue(regions[0].color_hex.startswith("#"))
+        self.assertLessEqual(max(regions[0].crop.size), pi.CROP_EDGE)
+
+        wide_array = np.full((1200, 1800, 3), 245, dtype=np.uint8)
+        wide_array[100:1100, 100:1700] = (180, 40, 40)
+        wide = Image.fromarray(wide_array, mode="RGB")
+        wide_labels = np.zeros((1200, 1800), dtype=np.int32)
+        wide_labels[100:1100, 100:1700] = 4
+        large = pi.regions_from_mask(wide_labels, wide, {4: "Upper-clothes"})
+        self.assertEqual(large[0].color, "Red")
+        self.assertLessEqual(max(large[0].crop.size), pi.CROP_EDGE)
+        self.assertEqual(pi.downscale(wide).size, (640, 427))
+
+        turned = Image.new("RGB", (40, 16), (180, 40, 40))
+        exif = turned.getexif()
+        exif[274] = 6
+        buffer = io.BytesIO()
+        turned.save(buffer, "JPEG", exif=exif, quality=95)
+        prepared = pi.prepare_photo(Image.open(io.BytesIO(buffer.getvalue())))
+        self.assertEqual(prepared.size, (16, 40))
+        self.assertEqual(prepared.mode, "RGB")
+
+        from PIL import ImageCms
+
+        source = ImageCms.createProfile("sRGB")
+        lab = ImageCms.createProfile("LAB")
+        forward = ImageCms.buildTransform(source, lab, "RGB", "LAB")
+        tagged = ImageCms.applyTransform(Image.new("RGB", (8, 8), (180, 40, 40)), forward)
+        tagged.info["icc_profile"] = ImageCms.ImageCmsProfile(lab).tobytes()
+        restored = pi.prepare_photo(tagged)
+        self.assertEqual(restored.mode, "RGB")
+        center = restored.getpixel((4, 4))
+        self.assertLess(max(abs(left - right) for left, right in zip(center, (180, 40, 40))), 8)
 
     def test_models_are_not_loaded_until_they_exist_locally(self):
         with tempfile.TemporaryDirectory() as tmp:

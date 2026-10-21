@@ -80,17 +80,28 @@ function blobUrl(key, blob) {
   return url;
 }
 
+function safeHex(value) {
+  return /^#[0-9A-Fa-f]{6}$/.test(value || "") ? value.toUpperCase() : "";
+}
+
+function colorHex(item) {
+  return safeHex(item?.colorHex || item?.extra?.["Color Hex"]);
+}
+
 function picture(item, key) {
   const url = blobUrl(key || `item-${item.id}`, item.imageBlob || item.cropBlob);
   if (url) return `<img src="${url}" alt="">`;
   const name = item.name || "Piece";
-  return `<div class="swatch" style="background:${swatchColor(item.color)}"><span>${escapeHtml(name)}</span></div>`;
+  const paint = colorHex(item) || swatchColor(item.color);
+  return `<div class="swatch" style="background:${paint}"><span>${escapeHtml(name)}</span></div>`;
 }
 
 function metaLine(item) {
   const season = item.season === "All" ? "All seasons" : item.season;
   const source = basename(item.sourcePhoto);
-  return `${item.category} · ${item.color} · ${season}${source ? ` · from ${source}` : ""}`;
+  const hex = colorHex(item);
+  const color = hex ? `${item.color} · ${hex}` : item.color;
+  return `${item.category} · ${color} · ${season}${source ? ` · from ${source}` : ""}`;
 }
 
 function options(values, current) {
@@ -298,6 +309,7 @@ function renderImport() {
           <label>Color<select name="color">${options(COLORS, garment.color)}</select></label>
           <label>Season<select name="season">${options(SEASONS, garment.season || "All")}</select></label>
         </div>
+        ${garment.colorHex ? `<p class="meta"><span class="chip" style="background:${safeHex(garment.colorHex) || swatchColor(garment.color)}"></span>Measured from the garment: ${escapeHtml(garment.color)} · ${escapeHtml(garment.colorHex)}</p>` : ""}
         <div class="row">
           <button class="primary" type="button" data-action="approve" data-id="${escapeHtml(garment.id)}">Approve</button>
           <button type="button" data-action="reject" data-id="${escapeHtml(garment.id)}">Reject</button>
@@ -307,7 +319,7 @@ function renderImport() {
   return `
     ${banner()}
     <h2>Import from photos</h2>
-    <p class="lede">Pick pictures already on this phone. The scan saves each finished photo before the next one, so leaving the app does not throw that work away.</p>
+    <p class="lede">Pick pictures already on this phone. The scan saves each finished photo before the next one, so leaving the app does not throw that work away. Photos are shrunk before the scan, and the color is read from the garment itself.</p>
     <div class="banner ok">Your pictures stay on this phone. The scan only reads them. It does not upload them. A private copy is kept until that photo is finished, then the copy is removed. The original is never changed. <a class="link" href="./privacy.html">Privacy</a></div>
     <div class="stack">
       <label class="file button">Choose photos<input id="pick-photos" type="file" accept="image/*" multiple></label>
@@ -494,6 +506,10 @@ async function onEdit(form) {
     season: data.get("season"),
     imageBlob: photo && photo.size ? photo : item.imageBlob,
   };
+  if (next.color !== item.color && next.extra?.["Color Hex"]) {
+    next.extra = { ...next.extra };
+    delete next.extra["Color Hex"];
+  }
   await saveItem(next);
   flash("ok", `Saved ${next.name}.`);
   render();
@@ -542,11 +558,13 @@ function garmentFields(id) {
   const garment = state.garments.find((row) => row.id === id);
   if (!card || !garment) return garment;
   const data = new FormData(card.querySelector("form"));
+  const color = data.get("color") || garment.color;
   return {
     ...garment,
     name: String(data.get("name") || garment.name).trim().slice(0, 80),
     category: data.get("category") || garment.category,
-    color: data.get("color") || garment.color,
+    color,
+    colorHex: color === garment.color ? garment.colorHex : "",
     season: data.get("season") || garment.season,
   };
 }
@@ -569,7 +587,7 @@ async function approvePrepared(garment) {
     sourcePhoto: source,
     sourcePhotos: (garment.sourceNames || [source]).filter(Boolean).join("|"),
     created: new Date().toISOString(),
-    extra: {},
+    extra: safeHex(garment.colorHex) ? { "Color Hex": safeHex(garment.colorHex) } : {},
   };
   await saveItem(item);
   await saveGarment({ ...garment, status: "approved", closetId: item.id, cropBlob: garment.cropBlob });

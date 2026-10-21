@@ -11,6 +11,8 @@ import {
   itemsFromCsv,
   itemsToCsv,
   mergeShoeBoxes,
+  dominantColor,
+  garmentMask,
   nearestColor,
   outfitsFromCsv,
   regionsFromLabelMasks,
@@ -73,6 +75,35 @@ test("summary mentions the fullest category", () => {
 
 test("color, outerwear heuristic, shoes, and tiny crops", () => {
   assert.equal(nearestColor(new Uint8Array([50, 90, 170])), "Blue");
+  const measured = dominantColor(new Uint8Array([50, 90, 170]));
+  assert.equal(measured.name, "Blue");
+  assert.match(measured.hex, /^#[0-9A-F]{6}$/);
+  const width = 6;
+  const height = 6;
+  const pixels = new Uint8Array(width * height * 3);
+  pixels.fill(245);
+  const garment = new Uint8Array(width * height);
+  for (let y = 1; y < 5; y += 1) {
+    for (let x = 1; x < 5; x += 1) {
+      if (y === 1 || y === 4 || x === 1 || x === 4) {
+        const index = y * width + x;
+        garment[index] = 1;
+        pixels[index * 3] = 180;
+        pixels[index * 3 + 1] = 40;
+        pixels[index * 3 + 2] = 40;
+      }
+    }
+  }
+  assert.equal(dominantColor(pixels, garment, 3).name, "Red");
+  assert.equal(dominantColor(pixels, null, 3).name, "White");
+  const skin = new Uint8Array(garment.length);
+  skin[1 * width + 1] = 1;
+  skin[1 * width + 2] = 1;
+  skin[1 * width + 3] = 1;
+  skin[1 * width + 4] = 1;
+  const cloth = garmentMask(garment, skin);
+  assert.equal(cloth[1 * width + 1], 0);
+  assert.equal(dominantColor(pixels, cloth, 3).name, "Red");
   assert.equal(classifyLabel("Upper-clothes", [20, 0, 160, 10], [0, 0, 200, 20]).category, "Outerwear");
   assert.equal(classifyLabel("Upper-clothes", [30, 0, 80, 10], [0, 0, 200, 20]).category, "Tops");
   assert.equal(classifyLabel("Upper-clothes", [0, 0, 200, 20], [0, 0, 200, 20]).category, "Tops");
@@ -120,7 +151,16 @@ test("regions keep a long top as outerwear and merge both shoes", () => {
     { label: "Right-shoe", binary: right, width, height },
   ]);
   assert.equal(regions.filter((region) => region.category === "Outerwear").length, 1);
-  assert.equal(regions.filter((region) => region.friendly === "shoes").length, 1);
+  const shoes = regions.find((region) => region.friendly === "shoes");
+  assert.ok(shoes);
+  assert.equal(shoes.binary[70 * width + 8], 1);
+  assert.equal(shoes.binary[70 * width + 32], 1);
+  assert.equal(shoes.binary[70 * width + 28], 0);
+  assert.equal(shoes.binary[70 * width + 20], 0);
+  const coat = regions.find((region) => region.category === "Outerwear").binary;
+  for (let y = 0; y < 8; y += 1) {
+    for (let x = 14; x < 26; x += 1) assert.equal(coat[y * width + x], 0);
+  }
 });
 
 test("file identity uses the relative path, size, and time", () => {

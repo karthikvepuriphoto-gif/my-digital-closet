@@ -23,7 +23,6 @@ SEGFORMER_DIR = CACHE / "segformer_b2_clothes"
 EMBEDDER_PATH = CACHE / "mobilenet_v3_small.pth"
 MARKER = CACHE / "ready.json"
 MODEL_ID = "mattmdjaga/segformer_b2_clothes"
-WORKING_EDGE = 640
 _MEAN = (0.485, 0.456, 0.406)
 _STD = (0.229, 0.224, 0.225)
 
@@ -137,17 +136,17 @@ def _download_files() -> None:
     )
 
 
-def _working_image(original):
+def _model_views(original):
+    """Return the detection-sized photo and the 32-pixel-aligned model input."""
     from PIL import Image
 
-    image = original.convert("RGB").copy()
-    image.thumbnail((WORKING_EDGE, WORKING_EDGE), Image.Resampling.LANCZOS)
-    width, height = image.size
+    working = pi.downscale(pi.prepare_photo(original), pi.DETECT_EDGE)
+    width, height = working.size
     snapped_w = max(32, (width // 32) * 32)
     snapped_h = max(32, (height // 32) * 32)
-    if (snapped_w, snapped_h) != image.size:
-        image = image.resize((snapped_w, snapped_h), Image.Resampling.LANCZOS)
-    return image
+    if (snapped_w, snapped_h) == working.size:
+        return working, working
+    return working, working.resize((snapped_w, snapped_h), Image.Resampling.LANCZOS)
 
 
 class LocalClothesFinder(pi.ClothesFinder):
@@ -169,8 +168,8 @@ class LocalClothesFinder(pi.ClothesFinder):
 
     def find(self, image):
         torch = self._torch
-        working = _working_image(image)
-        inputs = self.processor(images=working, return_tensors="pt", do_resize=False)
+        working, model_image = _model_views(image)
+        inputs = self.processor(images=model_image.copy(), return_tensors="pt", do_resize=False)
         with torch.inference_mode():
             logits = self.model(**inputs).logits
             sized = torch.nn.functional.interpolate(
@@ -180,7 +179,7 @@ class LocalClothesFinder(pi.ClothesFinder):
                 align_corners=False,
             )
             mask = sized.argmax(dim=1)[0].cpu().numpy()
-        return pi.regions_from_mask(mask, image.convert("RGB"), self.model.config.id2label)
+        return pi.regions_from_mask(mask, working, self.model.config.id2label)
 
 
 class LocalEmbedder(pi.Embedder):

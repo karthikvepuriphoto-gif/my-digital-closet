@@ -1000,7 +1000,7 @@ def page_import(items: pd.DataFrame, outfits: pd.DataFrame) -> None:
 
     page_title(
         "Import from photos",
-        "Point at a folder of pictures. Suggestions stay here until you approve them.",
+        "Point at a folder of pictures. Photos are shrunk before the scan. Suggestions stay here until you approve them.",
     )
     st.markdown(
         f'<div class="banner ok">{html.escape(pi.privacy_summary())}</div>',
@@ -1200,6 +1200,9 @@ def _import_card(items: pd.DataFrame, outfits: pd.DataFrame, output: Path, garme
             else:
                 swatch(str(garment.get("name") or "Piece"), str(garment.get("color") or "Beige"))
             st.caption(_source_caption(garment))
+            measured = str(garment.get("color_hex") or "").strip()
+            if measured:
+                st.caption(f"Measured from the garment: {garment.get('color') or ''} · {measured}")
             note = _guess_note(garment)
             if note:
                 st.caption(note)

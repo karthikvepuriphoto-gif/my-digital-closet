@@ -358,23 +358,162 @@ export function countBy(items, field) {
     .sort((left, right) => right.count - left.count || left.label.localeCompare(right.label));
 }
 
-export function nearestColor(pixels) {
-  const totals = Object.fromEntries(Object.keys(COLOR_RGB).map((name) => [name, 0]));
-  const step = Math.max(1, Math.floor(pixels.length / 3 / 1200));
-  for (let index = 0; index < pixels.length; index += 3 * step) {
-    const pixel = [pixels[index], pixels[index + 1], pixels[index + 2]];
-    let best = "Grey";
-    let bestDistance = Infinity;
-    for (const [name, rgb] of Object.entries(COLOR_RGB)) {
-      const distance = (pixel[0] - rgb[0]) ** 2 + (pixel[1] - rgb[1]) ** 2 + (pixel[2] - rgb[2]) ** 2;
-      if (distance < bestDistance) {
-        best = name;
-        bestDistance = distance;
+export const SKIN_LABELS = new Set(["face", "left-arm", "right-arm", "left-leg", "right-leg"]);
+const COLOR_SAMPLES = 2500;
+const XYZ_FROM_RGB = [
+  [0.4124564, 0.3575761, 0.1804375],
+  [0.2126729, 0.7151522, 0.072175],
+  [0.0193339, 0.119192, 0.9503041],
+];
+const RGB_FROM_XYZ = [
+  [3.2404542, -1.5371385, -0.4985314],
+  [-0.969266, 1.8760108, 0.041556],
+  [0.0556434, -0.2040259, 1.0572252],
+];
+const LAB_WHITE = [0.95047, 1, 1.08883];
+const LAB_DELTA = 6 / 29;
+let paletteLab = null;
+
+function srgbToLinear(channel) {
+  const value = channel / 255;
+  return value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+}
+
+function rgbToLab(red, green, blue) {
+  const linear = [srgbToLinear(red), srgbToLinear(green), srgbToLinear(blue)];
+  const xyz = XYZ_FROM_RGB.map((row) => row[0] * linear[0] + row[1] * linear[1] + row[2] * linear[2]);
+  const scaled = xyz.map((value, index) => value / LAB_WHITE[index]);
+  const curved = scaled.map((value) => (
+    value > LAB_DELTA ** 3 ? Math.cbrt(value) : value / (3 * LAB_DELTA ** 2) + 4 / 29
+  ));
+  return [116 * curved[1] - 16, 500 * (curved[0] - curved[1]), 200 * (curved[1] - curved[2])];
+}
+
+function labToRgb(lab) {
+  const lightness = (lab[0] + 16) / 116;
+  const curved = [lightness + lab[1] / 500, lightness, lightness - lab[2] / 200];
+  const scaled = curved.map((value) => (
+    value > LAB_DELTA ? value ** 3 : 3 * LAB_DELTA ** 2 * (value - 4 / 29)
+  ));
+  const xyz = scaled.map((value, index) => value * LAB_WHITE[index]);
+  const linear = RGB_FROM_XYZ.map((row) => Math.max(0, row[0] * xyz[0] + row[1] * xyz[1] + row[2] * xyz[2]));
+  return linear.map((value) => {
+    const encoded = value <= 0.0031308 ? 12.92 * value : 1.055 * value ** (1 / 2.4) - 0.055;
+    return Math.min(255, Math.max(0, Math.round(encoded * 255)));
+  });
+}
+
+function labDistance(left, right) {
+  return (left[0] - right[0]) ** 2 + (left[1] - right[1]) ** 2 + (left[2] - right[2]) ** 2;
+}
+
+function nearestName(rgb) {
+  if (!paletteLab) {
+    paletteLab = Object.entries(COLOR_RGB).map(([name, color]) => ({ name, lab: rgbToLab(...color) }));
+  }
+  const lab = rgbToLab(...rgb);
+  let best = "Grey";
+  let bestDistance = Infinity;
+  for (const entry of paletteLab) {
+    const distance = labDistance(lab, entry.lab);
+    if (distance < bestDistance) {
+      best = entry.name;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+function hexOf(rgb) {
+  return `#${rgb.map((value) => value.toString(16).padStart(2, "0")).join("")}`.toUpperCase();
+}
+
+function kmeans(points, k) {
+  const centers = [points[0].slice()];
+  while (centers.length < k) {
+    let bestIndex = 0;
+    let bestDistance = -1;
+    for (let index = 0; index < points.length; index += 1) {
+      let nearest = Infinity;
+      for (const center of centers) nearest = Math.min(nearest, labDistance(points[index], center));
+      if (nearest > bestDistance) {
+        bestDistance = nearest;
+        bestIndex = index;
       }
     }
-    totals[best] += 1;
+    if (bestDistance <= 1e-6) break;
+    centers.push(points[bestIndex].slice());
   }
-  return Object.entries(totals).sort((left, right) => right[1] - left[1])[0][0];
+  let labels = new Array(points.length).fill(0);
+  for (let iteration = 0; iteration < 12; iteration += 1) {
+    labels = points.map((point) => {
+      let best = 0;
+      let bestDistance = Infinity;
+      for (let index = 0; index < centers.length; index += 1) {
+        const distance = labDistance(point, centers[index]);
+        if (distance < bestDistance) {
+          best = index;
+          bestDistance = distance;
+        }
+      }
+      return best;
+    });
+    const sums = centers.map(() => [0, 0, 0, 0]);
+    for (let index = 0; index < points.length; index += 1) {
+      const bucket = sums[labels[index]];
+      bucket[0] += points[index][0];
+      bucket[1] += points[index][1];
+      bucket[2] += points[index][2];
+      bucket[3] += 1;
+    }
+    for (let index = 0; index < centers.length; index += 1) {
+      if (!sums[index][3]) continue;
+      centers[index] = [sums[index][0] / sums[index][3], sums[index][1] / sums[index][3], sums[index][2] / sums[index][3]];
+    }
+  }
+  return { centers, labels };
+}
+
+export function dominantColor(pixels, binary = null, channels = 3) {
+  const count = binary ? binary.length : Math.floor(pixels.length / channels);
+  const samples = [];
+  for (let index = 0; index < count; index += 1) {
+    if (binary && !binary[index]) continue;
+    samples.push(index);
+  }
+  if (!samples.length) return { name: "Grey", hex: "#8C8C8C" };
+  const step = Math.max(1, Math.ceil(samples.length / COLOR_SAMPLES));
+  const labs = [];
+  for (let index = 0; index < samples.length; index += step) {
+    const offset = samples[index] * channels;
+    labs.push(rgbToLab(pixels[offset], pixels[offset + 1], pixels[offset + 2]));
+  }
+  const { centers, labels } = kmeans(labs, labs.length >= 24 ? 3 : 1);
+  const totals = new Array(centers.length).fill(0);
+  for (const label of labels) totals[label] += 1;
+  let winner = 0;
+  for (let index = 1; index < totals.length; index += 1) {
+    if (totals[index] > totals[winner]) winner = index;
+  }
+  const rgb = labToRgb(centers[winner]);
+  return { name: nearestName(rgb), hex: hexOf(rgb) };
+}
+
+export function nearestColor(pixels) {
+  return dominantColor(pixels, null, pixels.length % 3 === 0 ? 3 : 4).name;
+}
+
+export function garmentMask(binary, skin) {
+  if (!binary || !skin) return binary;
+  const out = new Uint8Array(binary.length);
+  let kept = 0;
+  for (let index = 0; index < binary.length; index += 1) {
+    if (binary[index] && !skin[index]) {
+      out[index] = 1;
+      kept += 1;
+    }
+  }
+  return kept ? out : binary;
 }
 
 export function classifyLabel(label, box, personBox) {
@@ -394,7 +533,7 @@ export function classifyLabel(label, box, personBox) {
   return { category, folder, friendly, confidence };
 }
 
-export function componentBoxes(binary, width, height, minPixels) {
+export function componentParts(binary, width, height, minPixels) {
   const labels = new Int32Array(binary.length);
   const parent = [0];
   const find = (value) => {
@@ -424,24 +563,37 @@ export function componentBoxes(binary, width, height, minPixels) {
       }
     }
   }
-  const boxes = new Map();
+  const parts = new Map();
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const label = labels[y * width + x];
       if (!label) continue;
       const root = find(label);
-      const box = boxes.get(root) || { y0: y, x0: x, y1: y + 1, x1: x + 1, area: 0 };
-      box.y0 = Math.min(box.y0, y);
-      box.x0 = Math.min(box.x0, x);
-      box.y1 = Math.max(box.y1, y + 1);
-      box.x1 = Math.max(box.x1, x + 1);
-      box.area += 1;
-      boxes.set(root, box);
+      const part = parts.get(root) || { y0: y, x0: x, y1: y + 1, x1: x + 1, area: 0, binary: new Uint8Array(binary.length) };
+      part.y0 = Math.min(part.y0, y);
+      part.x0 = Math.min(part.x0, x);
+      part.y1 = Math.max(part.y1, y + 1);
+      part.x1 = Math.max(part.x1, x + 1);
+      part.area += 1;
+      part.binary[y * width + x] = 1;
+      parts.set(root, part);
     }
   }
-  return [...boxes.values()]
-    .filter((box) => box.area >= minPixels)
-    .map((box) => [box.y0, box.x0, box.y1, box.x1]);
+  return [...parts.values()]
+    .filter((part) => part.area >= minPixels)
+    .map((part) => ({ box: [part.y0, part.x0, part.y1, part.x1], binary: part.binary }));
+}
+
+export function componentBoxes(binary, width, height, minPixels) {
+  return componentParts(binary, width, height, minPixels).map((part) => part.box);
+}
+
+function orBinary(left, right) {
+  if (!left) return right || null;
+  if (!right) return left;
+  const out = new Uint8Array(left.length);
+  for (let index = 0; index < left.length; index += 1) out[index] = left[index] || right[index] ? 1 : 0;
+  return out;
 }
 
 export function boundsOf(binary, width, height) {
@@ -473,6 +625,7 @@ export function mergeShoeBoxes(shoes) {
       label: "Right-shoe",
       friendly: "shoes",
       confidence: Math.max(left[0].confidence, right[0].confidence),
+      binary: orBinary(left[0].binary, right[0].binary),
       box: [
         Math.min(first[0], second[0]),
         Math.min(first[1], second[1]),
@@ -496,17 +649,25 @@ export function regionsFromLabelMasks(labelMasks) {
   }
   const personBox = boundsOf(person, width, height);
   const minPixels = Math.max(30, Math.round(width * height * 0.008));
+  const skin = new Uint8Array(width * height);
+  for (const mask of labelMasks) {
+    if (!SKIN_LABELS.has(labelKey(mask.label))) continue;
+    for (let index = 0; index < skin.length; index += 1) {
+      if (mask.binary[index]) skin[index] = 1;
+    }
+  }
   const regions = [];
   const shoes = [];
   for (const mask of labelMasks) {
     const key = labelKey(mask.label);
     if (!LABEL_INFO[key]) continue;
-    for (const box of componentBoxes(mask.binary, width, height, minPixels)) {
-      const info = classifyLabel(mask.label, box, personBox);
+    for (const part of componentParts(mask.binary, width, height, minPixels)) {
+      const info = classifyLabel(mask.label, part.box, personBox);
+      const binary = garmentMask(part.binary, skin);
       if (key === "left-shoe" || key === "right-shoe") {
-        shoes.push({ label: mask.label, box, confidence: info.confidence });
+        shoes.push({ label: mask.label, box: part.box, confidence: info.confidence, binary });
       } else {
-        regions.push({ ...info, label: mask.label, box, maskWidth: width, maskHeight: height });
+        regions.push({ ...info, label: mask.label, box: part.box, binary, maskWidth: width, maskHeight: height });
       }
     }
   }
@@ -517,6 +678,7 @@ export function regionsFromLabelMasks(labelMasks) {
       friendly: shoe.friendly || info.friendly,
       label: shoe.label,
       box: shoe.box,
+      binary: garmentMask(shoe.binary, skin),
       maskWidth: width,
       maskHeight: height,
     });
