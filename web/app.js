@@ -18,6 +18,9 @@ import {
   sortItems,
   suggestLookName,
   formatBytes,
+  presetById,
+  projectionLine,
+  QUALITY_PRESETS,
   storageReport,
   swatchColor,
   validateOutfit,
@@ -25,7 +28,13 @@ import {
 import { clearStore, deleteRecord, loadCloset, putRecord, readAll } from "./db.js";
 import { bindRunner } from "./runner.js";
 import { describeProgress } from "./scan-session.js";
-import { shrinkStoredPhoto } from "./vision.js";
+import { downscaleBlob, reencodeSource, shrinkStoredPhoto } from "./vision.js";
+
+const SAMPLE_OUTFIT = [
+  ["./samples/coat.webp", "Coat"],
+  ["./samples/shirt.webp", "Shirt"],
+  ["./samples/shoes.webp", "Shoes"],
+];
 
 const state = {
   items: [],
@@ -54,6 +63,9 @@ const state = {
   job: null,
   onlyWhileCharging: false,
   keepAwake: false,
+  cropQuality: "small",
+  qualityChosen: false,
+  qualityPreview: null,
   stopPowerWait: null,
 };
 
@@ -323,6 +335,7 @@ function renderImport() {
   return `
     ${banner()}
     <h2>Import from photos</h2>
+    ${state.qualityChosen ? "" : qualityChooserHtml()}
     <p class="lede">Pick pictures already on this phone. Finished pieces are kept. The original photos are not copied onto the phone.</p>
     <div class="banner ok">Your pictures stay where they are. The scan only reads them. It does not upload them and it does not keep a copy. The color is saved before the small picture is compressed. <a class="link" href="./privacy.html">Privacy</a> · <a class="link" href="#settings">Storage</a></div>
     <div class="stack">
@@ -385,6 +398,45 @@ function renderPiece() {
     <p class="meta">${escapeHtml(metaLine(item))}</p>`;
 }
 
+function lookPieces(outfit) {
+  return ["topId", "bottomId", "fullBodyId", "outerwearId", "footwearId"]
+    .map((field) => itemById(outfit?.[field]))
+    .filter(Boolean);
+}
+
+function qualityChooserHtml() {
+  const preview = state.qualityPreview;
+  const columns = preview?.columns || QUALITY_PRESETS.map((preset) => ({ preset, files: [], average: 0 }));
+  const owned = state.items.filter((item) => item.imageBlob).length;
+  const cards = columns.map((column) => {
+    const preset = column.preset;
+    const photos = column.files.map((file) => `
+      <img src="${blobUrl(`preview-${preset.id}-${file.name}`, file.blob)}" alt="">
+      <span>${escapeHtml(file.name)} · ${formatBytes(file.bytes)}</span>`).join("");
+    const average = column.average || 0;
+    return `
+      <button type="button" class="preset" data-action="quality" data-id="${preset.id}" aria-pressed="${state.cropQuality === preset.id}">
+        <b>${escapeHtml(preset.label)}</b>
+        <span>${preset.edge} px · ${escapeHtml(preset.aim)}</span>
+        <div class="preset-photos">${photos || `<span>${preview?.loading ? "Preparing…" : ""}</span>`}</div>
+        ${average ? `<span>${formatBytes(average)} each</span>` : ""}
+        ${average && owned ? `<span>Your ${owned} ${owned === 1 ? "piece" : "pieces"} ≈ ${formatBytes(average * owned)}</span>` : ""}
+        ${average ? `<span>${projectionLine(average, 1000)}</span>` : ""}
+      </button>`;
+  }).join("");
+  const limited = preview?.limited
+    ? `<p class="hint">The original photo isn't available, so a larger size can't get sharper than the picture already saved.</p>`
+    : "";
+  return `
+    <section class="chooser" aria-label="Picture size">
+      <h2>Picture size</h2>
+      <p class="lede">Small is the default. The color is saved before the picture is compressed, so it stays the same at every size.</p>
+      <p class="meta">${escapeHtml(preview?.label || "Comparing picture sizes.")}</p>
+      ${limited}
+      <div class="presets">${cards}</div>
+    </section>`;
+}
+
 function renderSettings() {
   const report = storageReport({ items: state.items, garments: state.garments, inbox: state.inbox });
   const estimate = state.storageEstimate?.usage;
@@ -392,7 +444,8 @@ function renderSettings() {
   return `
     ${banner()}
     <h2>Settings</h2>
-    <p class="lede">Photos you pick are not copied. Each piece keeps one small picture, and its color is saved separately.</p>
+    ${qualityChooserHtml()}
+    <p class="lede">Photos you pick are not copied. Each piece keeps one picture at the size above, and its color is saved separately.</p>
     <div class="metrics">
       <div class="metric"><b>${formatBytes(report.totalBytes)}</b>Closet files</div>
       <div class="metric"><b>${formatBytes(report.averageBytes)}</b>Average per piece</div>
@@ -416,6 +469,141 @@ const views = {
   settings: renderSettings,
 };
 
+function previewSignature() {
+  const pending = state.garments.find((garment) => garment.status === "pending" && garment.cropBlob);
+  const outfit = [...state.outfits].reverse().find((row) => lookPieces(row).some((item) => item.imageBlob));
+  const item = [...state.items].reverse().find((row) => row.imageBlob);
+  return [pending?.id || "", pending?.cropBlob?.size || 0, outfit?.id || "", item?.id || "", item?.imageBlob?.size || 0].join("|");
+}
+
+function scheduleQualityPreview() {
+  const needed = state.screen === "settings" || (state.screen === "import" && !state.qualityChosen);
+  if (!needed) return;
+  const signature = previewSignature();
+  if (state.qualityPreview?.signature === signature) return;
+  state.qualityPreview = { signature, loading: true, columns: [], label: "Comparing picture sizes.", limited: false };
+  buildQualityPreview(signature);
+}
+
+async function previewSubject() {
+  const pending = state.garments.find((garment) => garment.status === "pending" && garment.cropBlob);
+  if (pending) {
+    const file = pending.sourceKey ? await runner.openSource(pending.sourceKey, pending.relativePath) : null;
+    return {
+      label: `This is ${pending.name || "a detected piece"}, from your scan.`,
+      limited: !file,
+      pieces: [{ name: pending.name || "Piece", blob: pending.cropBlob, file, cropBox: pending.cropBox }],
+    };
+  }
+  const outfit = [...state.outfits].reverse().find((row) => lookPieces(row).some((item) => item.imageBlob));
+  if (outfit) {
+    const pieces = [];
+    for (const item of lookPieces(outfit)) {
+      if (!item.imageBlob) continue;
+      const file = item.sourceKey ? await runner.openSource(item.sourceKey, item.relativePath) : null;
+      pieces.push({ name: item.name, blob: item.imageBlob, file, cropBox: item.cropBox });
+    }
+    if (pieces.length >= 2) {
+      return {
+        label: `This is your look, ${outfit.name}.`,
+        limited: pieces.some((piece) => !piece.file),
+        pieces,
+      };
+    }
+  }
+  const item = [...state.items].reverse().find((row) => row.imageBlob);
+  if (item) {
+    const file = item.sourceKey ? await runner.openSource(item.sourceKey, item.relativePath) : null;
+    return {
+      label: `This is your ${item.name}.`,
+      limited: !file,
+      pieces: [{ name: item.name, blob: item.imageBlob, file, cropBox: item.cropBox }],
+    };
+  }
+  return {
+    label: "Sample outfit, until you have clothes of your own.",
+    limited: false,
+    pieces: SAMPLE_OUTFIT.map(([url, name]) => ({ name, url })),
+  };
+}
+
+async function encodePreviewPiece(piece, preset) {
+  if (piece.file && Array.isArray(piece.cropBox)) return reencodeSource(piece.file, piece.cropBox, piece.blob, preset);
+  if (piece.file && !piece.blob) return shrinkStoredPhoto(piece.file, preset);
+  if (piece.blob) return downscaleBlob(piece.blob, preset);
+  const response = await fetch(piece.url);
+  if (!response.ok) throw new Error("The sample outfit could not be loaded.");
+  const blob = await response.blob();
+  return shrinkStoredPhoto(new File([blob], `${piece.name}.webp`, { type: blob.type || "image/webp" }), preset);
+}
+
+async function buildQualityPreview(signature) {
+  try {
+    const subject = await previewSubject();
+    const columns = [];
+    for (const preset of QUALITY_PRESETS) {
+      const files = [];
+      for (const piece of subject.pieces) {
+        const blob = await encodePreviewPiece(piece, preset);
+        files.push({ name: piece.name, blob, bytes: blob.size });
+      }
+      const average = files.length ? Math.round(files.reduce((total, file) => total + file.bytes, 0) / files.length) : 0;
+      columns.push({ preset, files, average });
+    }
+    if (state.qualityPreview?.signature !== signature) return;
+    state.qualityPreview = { signature, loading: false, columns, label: subject.label, limited: subject.limited };
+  } catch (error) {
+    if (state.qualityPreview?.signature !== signature) return;
+    state.qualityPreview = { signature, loading: false, columns: [], label: error.message || "The size comparison could not be prepared.", limited: false };
+  }
+  if (state.screen === "settings" || state.screen === "import") render();
+}
+
+async function transcodeRecord(record, blob) {
+  const preset = presetById(state.cropQuality);
+  if (record.sourceKey && Array.isArray(record.cropBox)) {
+    const source = await runner.openSource(record.sourceKey, record.relativePath);
+    if (source) return { blob: await reencodeSource(source, record.cropBox, blob, preset), how: "source" };
+  }
+  const next = await downscaleBlob(blob, preset);
+  return next === blob ? { blob, how: "kept" } : { blob: next, how: "down" };
+}
+
+async function applyQuality(id) {
+  const preset = presetById(id);
+  state.cropQuality = preset.id;
+  state.qualityChosen = true;
+  await runner.saveSettings();
+  let rebuilt = 0;
+  let shrunk = 0;
+  let kept = 0;
+  for (const garment of state.garments) {
+    if (!garment.cropBlob || garment.status === "rejected") continue;
+    const result = await transcodeRecord(garment, garment.cropBlob);
+    if (result.how === "kept") kept += 1;
+    else {
+      garment.cropBlob = result.blob;
+      await saveGarment(garment);
+      if (result.how === "source") rebuilt += 1;
+      else shrunk += 1;
+    }
+  }
+  for (const item of state.items) {
+    if (!item.imageBlob) continue;
+    const result = await transcodeRecord(item, item.imageBlob);
+    if (result.how === "kept") kept += 1;
+    else {
+      item.imageBlob = result.blob;
+      await saveItem(item);
+      if (result.how === "source") rebuilt += 1;
+      else shrunk += 1;
+    }
+  }
+  state.qualityPreview = null;
+  flash("ok", `${preset.label} is the picture size. ${rebuilt} rebuilt from the original photo, ${shrunk} made smaller, ${kept} left as they were.`);
+  render();
+}
+
 function render() {
   const active = document.activeElement;
   const activeId = active?.id;
@@ -423,6 +611,7 @@ function render() {
   const tally = `${word(state.items.length, "piece", "pieces")} · ${word(state.outfits.length, "look", "looks")}`;
   document.querySelector("#counts").textContent = state.progress ? state.progress : tally;
   document.querySelector("#screen").innerHTML = (views[state.screen] || renderCloset)();
+  scheduleQualityPreview();
   for (const link of document.querySelectorAll(".tabbar a, #settings-link")) {
     const on = link.getAttribute("href") === `#${state.screen}`;
     if (on) link.setAttribute("aria-current", "page");
@@ -502,7 +691,7 @@ async function onAdd(form) {
     name: name.slice(0, 80),
     color: data.get("color"),
     season: data.get("season"),
-    imageBlob: photo && photo.size ? await shrinkStoredPhoto(photo) : null,
+    imageBlob: photo && photo.size ? await shrinkStoredPhoto(photo, presetById(state.cropQuality)) : null,
     sourcePhoto: "",
     sourcePhotos: "",
     created: new Date().toISOString(),
@@ -530,7 +719,7 @@ async function onEdit(form) {
     category: data.get("category"),
     color: data.get("color"),
     season: data.get("season"),
-    imageBlob: photo && photo.size ? await shrinkStoredPhoto(photo) : item.imageBlob,
+    imageBlob: photo && photo.size ? await shrinkStoredPhoto(photo, presetById(state.cropQuality)) : item.imageBlob,
   };
   if (next.color !== item.color && next.extra?.["Color Hex"]) {
     next.extra = { ...next.extra };
@@ -610,6 +799,9 @@ async function approvePrepared(garment) {
     color: garment.color,
     season: garment.season || "All",
     imageBlob: garment.cropBlob,
+    sourceKey: garment.sourceKey || "",
+    relativePath: garment.relativePath || "",
+    cropBox: garment.cropBox || null,
     sourcePhoto: source,
     sourcePhotos: (garment.sourceNames || [source]).filter(Boolean).join("|"),
     created: new Date().toISOString(),
@@ -667,16 +859,16 @@ async function reclaimSpace() {
       continue;
     }
     if (!garment.cropBlob) continue;
-    const smaller = await shrinkStoredPhoto(garment.cropBlob);
-    if (smaller.size < garment.cropBlob.size) {
+    const smaller = await downscaleBlob(garment.cropBlob, presetById(state.cropQuality));
+    if (smaller !== garment.cropBlob && smaller.size < garment.cropBlob.size) {
       garment.cropBlob = smaller;
       await saveGarment(garment);
     }
   }
   for (const item of state.items) {
     if (!item.imageBlob) continue;
-    const smaller = await shrinkStoredPhoto(item.imageBlob);
-    if (smaller.size < item.imageBlob.size) {
+    const smaller = await downscaleBlob(item.imageBlob, presetById(state.cropQuality));
+    if (smaller !== item.imageBlob && smaller.size < item.imageBlob.size) {
       item.imageBlob = smaller;
       await saveItem(item);
     }
@@ -794,7 +986,7 @@ async function migrate(form, mode) {
   for (const file of [...images, ...zippedImages]) photos.set(file.name.toLowerCase(), file);
   for (const item of items) {
     const file = photos.get(basename(item.imagePath).toLowerCase());
-    if (file) item.imageBlob = await shrinkStoredPhoto(file);
+    if (file) item.imageBlob = await shrinkStoredPhoto(file, presetById(state.cropQuality));
   }
   if (mode === "replace") {
     await clearStore("items");
@@ -854,7 +1046,14 @@ document.body.addEventListener("click", async (event) => {
       await state.installEvent.userChoice;
       state.installEvent = null;
       render();
+    } else if (action === "quality") {
+      await applyQuality(button.dataset.id);
     } else if (action === "scan") {
+      if (!state.qualityChosen) {
+        state.cropQuality = presetById(state.cropQuality).id;
+        state.qualityChosen = true;
+        await runner.saveSettings();
+      }
       await runner.start(button.dataset.limit ? Number(button.dataset.limit) : null);
     } else if (action === "stop-scan") {
       runner.stopAfterPhoto();
@@ -965,6 +1164,8 @@ async function boot() {
     if (settings) {
       state.onlyWhileCharging = Boolean(settings.onlyWhileCharging);
       state.keepAwake = Boolean(settings.keepAwake);
+      state.cropQuality = presetById(settings.cropQuality).id;
+      state.qualityChosen = Boolean(settings.qualityChosen);
     }
     if (job) state.job = job;
   } catch (error) {

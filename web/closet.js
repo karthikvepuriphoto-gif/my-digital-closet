@@ -748,6 +748,26 @@ export function scaledCropBox(box, maskWidth, maskHeight, imageWidth, imageHeigh
   return [left, top, right, bottom];
 }
 
+export const QUALITY_PRESETS = [
+  { id: "small", label: "Small", edge: 384, quality: 0.8, aim: "About 20–40 KB" },
+  { id: "medium", label: "Medium", edge: 640, quality: 0.8, aim: "About 50–100 KB" },
+  { id: "high", label: "High", edge: 1024, quality: 0.85, aim: "About 150–300 KB" },
+];
+
+export function presetById(id) {
+  return QUALITY_PRESETS.find((preset) => preset.id === id) || QUALITY_PRESETS[0];
+}
+
+export function formatCount(value) {
+  return Math.max(0, Math.round(Number(value) || 0)).toLocaleString("en-US");
+}
+
+export function projectionLine(bytesPerItem, count = 1000) {
+  const perItem = Math.max(0, Math.round(Number(bytesPerItem) || 0));
+  const items = Math.max(0, Math.round(Number(count) || 0));
+  return `~${formatCount(items)} items ≈ ${formatBytes(perItem * items)}`;
+}
+
 export function storageReport({ items = [], garments = [], inbox = [] } = {}) {
   const pieceSizes = items.map((item) => item.imageBlob?.size || 0).filter((size) => size > 0);
   const reviewSizes = garments

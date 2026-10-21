@@ -17,6 +17,9 @@ import {
   outfitsFromCsv,
   regionsFromLabelMasks,
   formatBytes,
+  presetById,
+  projectionLine,
+  QUALITY_PRESETS,
   scaledCropBox,
   scrubOutfits,
   storageReport,
@@ -185,6 +188,15 @@ test("storage counts one photo per piece and leftover originals", () => {
   assert.equal(formatBytes(800), "800 B");
   const csv = itemsToCsv([{ id: 4, name: "Coat", category: "Outerwear", color: "Blue", season: "All", imageBlob: { type: "image/webp" }, extra: {} }]);
   assert.match(csv, /closet_images\/item_4\.webp/);
+});
+
+test("picture size defaults to small and projects a closet", () => {
+  assert.equal(presetById("missing").id, "small");
+  assert.equal(QUALITY_PRESETS[0].edge, 384);
+  assert.equal(QUALITY_PRESETS[1].edge, 640);
+  assert.equal(QUALITY_PRESETS[2].edge, 1024);
+  assert.equal(projectionLine(30 * 1024, 1000), "~1,000 items ≈ 29.3 MB");
+  assert.equal(projectionLine(24 * 1024, 12), "~12 items ≈ 288 KB");
 });
 
 test("file identity uses the relative path, size, and time", () => {

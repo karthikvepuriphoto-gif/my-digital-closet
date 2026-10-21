@@ -1,4 +1,4 @@
-const CACHE = "closet-shell-v6";
+const CACHE = "closet-shell-v7";
 const SHELL = [
   "./",
   "./index.html",
@@ -17,6 +17,9 @@ const SHELL = [
   "./icons/icon-512.png",
   "./icons/icon-maskable-512.png",
   "./icons/apple-touch-icon.png",
+  "./samples/coat.webp",
+  "./samples/shirt.webp",
+  "./samples/shoes.webp",
 ];
 
 self.addEventListener("install", (event) => {

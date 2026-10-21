@@ -373,7 +373,9 @@ class PhotoImportTests(unittest.TestCase):
         wide_labels[100:1100, 100:1700] = 4
         large = pi.regions_from_mask(wide_labels, wide, {4: "Upper-clothes"})
         self.assertEqual(large[0].color, "Red")
-        self.assertLessEqual(max(large[0].crop.size), pi.CROP_EDGE)
+        self.assertLessEqual(max(large[0].crop.size), pi.HIGH_EDGE)
+        self.assertGreater(max(large[0].crop.size), pi.CROP_EDGE)
+        self.assertIsNotNone(large[0].crop_box)
         self.assertEqual(pi.downscale(wide).size, (640, 427))
 
         turned = Image.new("RGB", (40, 16), (180, 40, 40))
@@ -423,6 +425,54 @@ class PhotoImportTests(unittest.TestCase):
             again = pi.reclaim_output(output)
             self.assertEqual(again["crop_count"], 1)
             self.assertEqual(len(list(output.rglob("*.webp"))), 1)
+
+    def test_presets_never_enlarge_and_high_keeps_more_detail(self):
+        small_source = Image.new("RGBA", (300, 180), (180, 40, 40, 255))
+        for spec in pi.PRESET_LIST:
+            with Image.open(io.BytesIO(pi.encode_webp(small_source, spec))) as image:
+                self.assertLessEqual(max(image.size), 300)
+        wide = Image.new("RGB", (1800, 1200), (50, 90, 170))
+        with Image.open(io.BytesIO(pi.encode_webp(wide, "small"))) as image:
+            self.assertLessEqual(max(image.size), pi.PRESETS["small"]["edge"])
+        with Image.open(io.BytesIO(pi.encode_webp(wide, "high"))) as image:
+            self.assertEqual(max(image.size), pi.PRESETS["high"]["edge"])
+        self.assertEqual(pi.resolve_preset(None)["id"], "small")
+        self.assertEqual(pi.projection_line(30 * 1024, 1000), "~1,000 items ≈ 29.3 MB")
+
+    def test_changing_size_uses_the_source_and_does_not_invent_detail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            photo = _photo(source, "coat.png", color=(180, 40, 40), size=(900, 1200))
+            list(pi.scan_folder(source, output, ScriptedFinder([[_region(size=(900, 1200))]]), MeanEmbedder(), preset="small"))
+            garment = pi.pending_garments(output)[0]
+            saved_color = garment["color"]
+            saved_hex = garment["color_hex"]
+            # The scripted crop has no box, so a larger preset cannot invent detail.
+            grown = pi.apply_quality(output, "high", root)
+            self.assertEqual(grown["rebuilt"], 0)
+            self.assertEqual(grown["kept"], 1)
+            again = pi.load_state(output)["garments"][garment["id"]]
+            self.assertEqual(again["color"], saved_color)
+            self.assertEqual(again["color_hex"], saved_hex)
+            with Image.open(again["crop_path"]) as image:
+                self.assertLessEqual(max(image.size), 900)
+
+            listed = pi.load_state(output)
+            listed["garments"][garment["id"]]["crop_box"] = [0.1, 0.1, 0.8, 0.9]
+            pi.save_state(output, listed)
+            rebuilt = pi.apply_quality(output, "medium", root)
+            self.assertEqual(rebuilt["rebuilt"], 1)
+            kept = pi.load_state(output)["garments"][garment["id"]]
+            self.assertEqual(kept["color"], saved_color)
+            self.assertEqual(kept["color_hex"], saved_hex)
+            with Image.open(kept["crop_path"]) as image:
+                self.assertLessEqual(max(image.size), pi.PRESETS["medium"]["edge"])
+                self.assertGreater(max(image.size), 300)
+                pixel = image.convert("RGB").getpixel((image.size[0] // 2, image.size[1] // 2))
+                self.assertGreater(pixel[0], pixel[2])
 
     def test_models_are_not_loaded_until_they_exist_locally(self):
         with tempfile.TemporaryDirectory() as tmp:

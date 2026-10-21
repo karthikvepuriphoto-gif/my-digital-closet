@@ -6,14 +6,14 @@
 import {
   dominantColor,
   labelKey,
+  presetById,
   regionsFromLabelMasks,
   scaledCropBox,
   suggestName,
 } from "./closet.js";
 
 const DETECT_EDGE = 640;
-const CROP_EDGE = 384;
-const WEBP_QUALITY = 0.8;
+const EMBED_EDGE = 384;
 
 const SEGMENTER_ID = "Xenova/segformer_b0_clothes";
 const EMBEDDER_ID = "Xenova/dinov2-small";
@@ -133,27 +133,30 @@ function scaleBinary(binary, srcWidth, srcHeight, dstWidth, dstHeight) {
   return out;
 }
 
-function canvasBlob(canvas, type = "image/webp", quality = WEBP_QUALITY) {
+function canvasBlob(canvas, type = "image/webp", quality = 0.8) {
   return new Promise((resolve, reject) => {
     canvas.toBlob((blob) => (blob ? resolve(blob) : reject(new Error("Could not keep a copy of that crop."))), type, quality);
   });
 }
 
-function maskedCrop(working, binary, box) {
+function maskedCrop(source, binary, maskWidth, maskHeight, box) {
   const [left, top, right, bottom] = box;
-  const width = right - left;
-  const height = bottom - top;
+  const width = Math.max(1, right - left);
+  const height = Math.max(1, bottom - top);
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
   const context = drawingContext(canvas);
-  context.drawImage(working, left, top, width, height, 0, 0, width, height);
-  if (!binary) return canvas;
+  context.drawImage(source, left, top, width, height, 0, 0, width, height);
+  if (!binary || !maskWidth || !maskHeight) return canvas;
   const image = context.getImageData(0, 0, width, height);
-  const frameWidth = working.width;
+  const frameWidth = source.width;
+  const frameHeight = source.height;
   for (let y = 0; y < height; y += 1) {
+    const srcY = Math.min(maskHeight - 1, Math.floor(((top + y) * maskHeight) / frameHeight));
     for (let x = 0; x < width; x += 1) {
-      if (!binary[(top + y) * frameWidth + (left + x)]) image.data[(y * width + x) * 4 + 3] = 0;
+      const srcX = Math.min(maskWidth - 1, Math.floor(((left + x) * maskWidth) / frameWidth));
+      if (!binary[srcY * maskWidth + srcX]) image.data[(y * width + x) * 4 + 3] = 0;
     }
   }
   context.putImageData(image, 0, 0);
@@ -171,13 +174,92 @@ function embedCanvas(source) {
   return canvas;
 }
 
-export async function shrinkStoredPhoto(file) {
+function presetEdge(preset, longEdge) {
+  return Math.max(1, Math.min(preset.edge, longEdge || preset.edge));
+}
+
+export async function shrinkStoredPhoto(file, preset = presetById("small")) {
   const decoded = await decodePhoto(file);
-  const canvas = canvasSource(decoded, CROP_EDGE);
+  const longEdge = Math.max(decoded.width, decoded.height);
+  const canvas = canvasSource(decoded, presetEdge(preset, longEdge));
   decoded.close?.();
-  const blob = await canvasBlob(canvas);
-  if (file.size && file.type === "image/webp" && blob.size >= file.size) return file;
+  const blob = await canvasBlob(canvas, "image/webp", preset.quality);
+  if (file.size && file.type === "image/webp" && blob.size >= file.size && longEdge <= preset.edge) return file;
   return new File([blob], "piece.webp", { type: blob.type || "image/webp" });
+}
+
+export async function downscaleBlob(blob, preset = presetById("small")) {
+  if (!blob) return blob;
+  const decoded = await decodePhoto(blob);
+  const longEdge = Math.max(decoded.width, decoded.height);
+  if (longEdge <= preset.edge) {
+    decoded.close?.();
+    return blob;
+  }
+  const canvas = canvasSource(decoded, preset.edge);
+  decoded.close?.();
+  const next = await canvasBlob(canvas, "image/webp", preset.quality);
+  return next.size < blob.size ? next : blob;
+}
+
+function cropNormalized(decoded, cropBox) {
+  const width = decoded.width;
+  const height = decoded.height;
+  let left = 0;
+  let top = 0;
+  let right = width;
+  let bottom = height;
+  if (Array.isArray(cropBox) && cropBox.length === 4) {
+    left = Math.max(0, Math.floor(Number(cropBox[0]) * width));
+    top = Math.max(0, Math.floor(Number(cropBox[1]) * height));
+    right = Math.min(width, Math.ceil(Number(cropBox[2]) * width));
+    bottom = Math.min(height, Math.ceil(Number(cropBox[3]) * height));
+    if (right - left < 2 || bottom - top < 2) {
+      left = 0;
+      top = 0;
+      right = width;
+      bottom = height;
+    }
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = right - left;
+  canvas.height = bottom - top;
+  drawingContext(canvas).drawImage(decoded, left, top, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+async function copyAlpha(canvas, blob) {
+  if (!blob) return canvas;
+  try {
+    const old = await decodePhoto(blob);
+    const mask = document.createElement("canvas");
+    mask.width = canvas.width;
+    mask.height = canvas.height;
+    const maskContext = drawingContext(mask);
+    maskContext.drawImage(old, 0, 0, mask.width, mask.height);
+    old.close?.();
+    const context = drawingContext(canvas);
+    const cut = context.getImageData(0, 0, canvas.width, canvas.height);
+    const alpha = maskContext.getImageData(0, 0, mask.width, mask.height);
+    let transparent = false;
+    for (let index = 3; index < cut.data.length; index += 4) {
+      cut.data[index] = alpha.data[index];
+      if (alpha.data[index] < 250) transparent = true;
+    }
+    if (transparent) context.putImageData(cut, 0, 0);
+  } catch {
+    // A source photo without a saved silhouette keeps the rectangular crop.
+  }
+  return canvas;
+}
+
+export async function reencodeSource(file, cropBox, currentBlob, preset = presetById("small")) {
+  const decoded = await decodePhoto(file);
+  const canvas = await copyAlpha(cropNormalized(decoded, cropBox), currentBlob);
+  decoded.close?.();
+  const longEdge = Math.max(canvas.width, canvas.height);
+  const sized = canvasSource(canvas, presetEdge(preset, longEdge));
+  return canvasBlob(sized, "image/webp", preset.quality);
 }
 
 async function embeddingOf(embedder, canvas) {
@@ -187,11 +269,10 @@ async function embeddingOf(embedder, canvas) {
   return raw.map((value) => Math.round(Number(value) * 100000) / 100000);
 }
 
-export async function findGarments(file, onProgress) {
+export async function findGarments(file, onProgress, preset = presetById("small")) {
   const { segmenter, embedder } = await ensureModels(onProgress);
   const decoded = await decodePhoto(file);
   const working = canvasSource(decoded, DETECT_EDGE);
-  decoded.close?.();
   const frame = drawingContext(working).getImageData(0, 0, working.width, working.height).data;
   const input = await canvasBlob(working, "image/png");
   const masks = await segmenter(input);
@@ -207,13 +288,15 @@ export async function findGarments(file, onProgress) {
   }
   const found = [];
   for (const region of regions) {
-    const cropBox = scaledCropBox(region.box, region.maskWidth, region.maskHeight, working.width, working.height);
-    if (!cropBox) continue;
+    const fullBox = scaledCropBox(region.box, region.maskWidth, region.maskHeight, decoded.width, decoded.height);
+    if (!fullBox) continue;
     const aligned = scaleBinary(region.binary, region.maskWidth, region.maskHeight, working.width, working.height);
     const measured = aligned
       ? dominantColor(frame, aligned, 4)
       : dominantColor(frame, null, 4);
-    const modest = canvasSource(maskedCrop(working, aligned, cropBox), CROP_EDGE);
+    const cut = maskedCrop(decoded, region.binary, region.maskWidth, region.maskHeight, fullBox);
+    const forEmbed = canvasSource(cut, EMBED_EDGE);
+    const stored = canvasSource(cut, presetEdge(preset, Math.max(cut.width, cut.height)));
     const friendly = region.friendly;
     found.push({
       label: region.label,
@@ -225,8 +308,14 @@ export async function findGarments(file, onProgress) {
       colorHex: measured.hex,
       name: suggestName(measured.name, friendly),
       season: "All",
-      cropBlob: await canvasBlob(modest),
-      embedding: await embeddingOf(embedder, embedCanvas(modest)),
+      cropBox: [
+        fullBox[0] / decoded.width,
+        fullBox[1] / decoded.height,
+        fullBox[2] / decoded.width,
+        fullBox[3] / decoded.height,
+      ],
+      cropBlob: await canvasBlob(stored, "image/webp", preset.quality),
+      embedding: await embeddingOf(embedder, embedCanvas(forEmbed)),
       note: labelKey(region.label).startsWith("upper") && region.category === "Outerwear"
         ? "Suggested as outerwear because the piece looks long. Change it if it is a shirt."
         : region.confidence < 0.6
@@ -234,5 +323,6 @@ export async function findGarments(file, onProgress) {
           : "",
     });
   }
+  decoded.close?.();
   return found;
 }

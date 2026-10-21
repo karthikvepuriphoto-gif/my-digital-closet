@@ -1,6 +1,6 @@
 /** One-photo-at-a-time scan. Each finished photo is saved before the next one starts. */
 
-import { findDuplicate } from "./closet.js";
+import { findDuplicate, presetById } from "./closet.js";
 import { deleteRecord, getRecord, putRecord, readAll, readInbox } from "./db.js";
 import {
   COOLDOWN_MS,
@@ -55,6 +55,8 @@ export function bindRunner(ctx) {
       id: "settings",
       onlyWhileCharging: Boolean(state.onlyWhileCharging),
       keepAwake: Boolean(state.keepAwake),
+      cropQuality: state.cropQuality || "small",
+      qualityChosen: Boolean(state.qualityChosen),
     });
   }
 
@@ -118,7 +120,7 @@ export function bindRunner(ctx) {
     const garmentIds = [];
     let created = 0;
     try {
-      const regions = await findGarments(source);
+      const regions = await findGarments(source, null, presetById(state.cropQuality));
       if (`${source.size}:${source.lastModified}` !== before) {
         throw new Error(`${entry.name} changed while it was being read. Stopped.`);
       }
@@ -144,6 +146,8 @@ export function bindRunner(ctx) {
             status: "pending",
             sourceName: entry.name,
             sourceNames: [entry.name],
+            sourceKey: entry.key,
+            relativePath: entry.relativePath || "",
             created: stamp(),
             closetId: null,
             ...region,
@@ -457,5 +461,8 @@ export function bindRunner(ctx) {
     notePower: () => window.dispatchEvent(new Event("closet-power")),
     inPlayApp,
     watchPower,
+    openSource(key, relativePath) {
+      return sourceFile({ key, relativePath });
+    },
   };
 }

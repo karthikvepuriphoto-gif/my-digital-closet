@@ -168,7 +168,8 @@ class LocalClothesFinder(pi.ClothesFinder):
 
     def find(self, image):
         torch = self._torch
-        working, model_image = _model_views(image)
+        prepared = pi.prepare_photo(image)
+        working, model_image = _model_views(prepared)
         inputs = self.processor(images=model_image.copy(), return_tensors="pt", do_resize=False)
         with torch.inference_mode():
             logits = self.model(**inputs).logits
@@ -179,7 +180,8 @@ class LocalClothesFinder(pi.ClothesFinder):
                 align_corners=False,
             )
             mask = sized.argmax(dim=1)[0].cpu().numpy()
-        return pi.regions_from_mask(mask, working, self.model.config.id2label)
+        # Color stays on the 640-pixel view. The saved crop is cut from the full photo.
+        return pi.regions_from_mask(mask, prepared, self.model.config.id2label, color_image=working)
 
 
 class LocalEmbedder(pi.Embedder):

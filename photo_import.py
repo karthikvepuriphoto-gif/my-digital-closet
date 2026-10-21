@@ -68,10 +68,19 @@ COLOR_RGB = {
     "Orange": (220, 120, 40),
     "Purple": (110, 70, 150),
 }
-# Long edge before detection. Crops are saved smaller than this.
+# Long edge before detection. The saved crop is a separate choice.
 DETECT_EDGE = 640
-CROP_EDGE = 384
-WEBP_QUALITY = 80
+PRESETS = {
+    "small": {"id": "small", "label": "Small", "edge": 384, "quality": 80, "aim": "About 20–40 KB"},
+    "medium": {"id": "medium", "label": "Medium", "edge": 640, "quality": 80, "aim": "About 50–100 KB"},
+    "high": {"id": "high", "label": "High", "edge": 1024, "quality": 85, "aim": "About 150–300 KB"},
+}
+PRESET_LIST = [PRESETS["small"], PRESETS["medium"], PRESETS["high"]]
+CROP_EDGE = PRESETS["small"]["edge"]
+WEBP_QUALITY = PRESETS["small"]["quality"]
+HIGH_EDGE = PRESETS["high"]["edge"]
+PREFS_NAME = "storage_prefs.json"
+SAMPLE_DIR = Path(__file__).resolve().parent / "web" / "samples"
 # Stride over the detection-sized photo. This is not a tiny thumbnail.
 COLOR_SAMPLES = 2500
 SKIN_LABELS = {"face", "left-arm", "right-arm", "left-leg", "right-leg"}
@@ -111,6 +120,7 @@ class Region:
     confidence: float
     color: str = ""
     color_hex: str = ""
+    crop_box: tuple[float, float, float, float] | None = None
 
 
 @dataclass
@@ -193,6 +203,7 @@ def scan_folder(
     embedder: Embedder,
     *,
     limit: int | None = None,
+    preset: str | dict | None = "small",
 ):
     """Scan new or changed photos. Yields progress. Original files are not opened for writing."""
     source, output = ensure_separate_folders(source, output)
@@ -231,7 +242,7 @@ def scan_folder(
             )
         new_ids: list[str] = []
         for region in regions:
-            garment_id, created = _record_region(state, output, path, region, embedder)
+            garment_id, created = _record_region(state, output, path, region, embedder, preset)
             if garment_id and garment_id not in new_ids:
                 new_ids.append(garment_id)
             if created:
@@ -379,22 +390,77 @@ def downscale(image: Image.Image, edge: int = DETECT_EDGE) -> Image.Image:
     return copy
 
 
-def modest_crop(image: Image.Image) -> Image.Image:
-    if max(image.size) <= CROP_EDGE:
+def resolve_preset(preset: str | dict | None = None) -> dict:
+    if isinstance(preset, dict) and preset.get("id") in PRESETS:
+        return PRESETS[str(preset["id"])]
+    return PRESETS.get(str(preset or "small"), PRESETS["small"])
+
+
+def modest_crop(image: Image.Image, edge: int = CROP_EDGE) -> Image.Image:
+    """Shrink the long edge. Never enlarge a picture."""
+    if max(image.size) <= edge:
         return image
     copy = image.copy()
-    copy.thumbnail((CROP_EDGE, CROP_EDGE), Image.Resampling.LANCZOS)
+    copy.thumbnail((edge, edge), Image.Resampling.LANCZOS)
     return copy
 
 
-def encode_webp(image: Image.Image) -> bytes:
-    """Small lossy WebP. Call this only after the color has been measured."""
-    prepared = modest_crop(image)
+def encode_webp(image: Image.Image, preset: str | dict | None = "small") -> bytes:
+    """Lossy WebP at the chosen size. Call this only after the color has been measured."""
+    spec = resolve_preset(preset)
+    prepared = modest_crop(image, int(spec["edge"]))
     if prepared.mode != "RGBA":
         prepared = prepared.convert("RGBA")
     buffer = io.BytesIO()
-    prepared.save(buffer, "WEBP", quality=WEBP_QUALITY, method=6)
+    prepared.save(buffer, "WEBP", quality=int(spec["quality"]), method=6)
     return buffer.getvalue()
+
+
+def format_bytes(size: int) -> str:
+    amount = max(0, int(size))
+    if amount < 1024:
+        return f"{amount} B"
+    if amount < 1024 * 1024:
+        kb = amount / 1024
+        return f"{kb:.1f} KB" if kb < 10 else f"{kb:.0f} KB"
+    return f"{amount / (1024 * 1024):.1f} MB"
+
+
+def projection_line(bytes_per_item: int, count: int = 1000) -> str:
+    total = max(0, int(bytes_per_item)) * max(0, int(count))
+    return f"~{int(count):,} items ≈ {format_bytes(total)}"
+
+
+def prefs_path(root: Path | None = None) -> Path:
+    return (root or w.APP_DIR) / PREFS_NAME
+
+
+def current_preset(root: Path | None = None) -> dict:
+    path = prefs_path(root)
+    preset_id = "small"
+    if path.is_file():
+        try:
+            preset_id = str(json.loads(path.read_text(encoding="utf-8")).get("crop_quality") or "small")
+        except (OSError, json.JSONDecodeError, TypeError):
+            preset_id = "small"
+    return resolve_preset(preset_id)
+
+
+def quality_chosen(root: Path | None = None) -> bool:
+    path = prefs_path(root)
+    if not path.is_file():
+        return False
+    try:
+        return bool(json.loads(path.read_text(encoding="utf-8")).get("chosen"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return False
+
+
+def save_preset(preset: str | dict, root: Path | None = None) -> dict:
+    spec = resolve_preset(preset)
+    path = prefs_path(root)
+    path.write_text(json.dumps({"crop_quality": spec["id"], "chosen": True}), encoding="utf-8")
+    return spec
 
 
 def flatten_for_embed(image: Image.Image) -> Image.Image:
@@ -461,8 +527,13 @@ def classify_label(label: str, box: tuple[int, int, int, int], person_box: tuple
     return category, folder, friendly, confidence
 
 
-def regions_from_mask(mask: np.ndarray, original: Image.Image, id2label: dict) -> list[Region]:
-    """Turn a segmentation mask into modest garment crops and a measured color."""
+def regions_from_mask(
+    mask: np.ndarray,
+    original: Image.Image,
+    id2label: dict,
+    color_image: Image.Image | None = None,
+) -> list[Region]:
+    """Turn a segmentation mask into garment crops and a measured color."""
     if mask.ndim != 2:
         raise PhotoImportError("The clothing mask has the wrong shape.")
     mask_h, mask_w = mask.shape
@@ -492,7 +563,7 @@ def regions_from_mask(mask: np.ndarray, original: Image.Image, id2label: dict) -
                 shoes.append((name, box, classify_label(name, box, person_box)[3], component))
                 continue
             region = _region_from_component(
-                original, name, box, component, skin, scale_x, scale_y, person_box
+                original, name, box, component, skin, scale_x, scale_y, person_box, color_image=color_image
             )
             if region is not None:
                 regions.append(region)
@@ -508,6 +579,7 @@ def regions_from_mask(mask: np.ndarray, original: Image.Image, id2label: dict) -
             scale_y,
             person_box,
             friendly="shoes" if len(merged) == 1 and len(shoes) == 2 else None,
+            color_image=color_image,
         )
         if region is not None:
             regions.append(region)
@@ -570,12 +642,23 @@ def similarity(left: list[float], right: list[float]) -> float:
     return float(np.dot(first, second) / denom)
 
 
-def _record_region(state: dict, output: Path, source: Path, region: Region, embedder: Embedder) -> tuple[str | None, bool]:
+def _record_region(
+    state: dict,
+    output: Path,
+    source: Path,
+    region: Region,
+    embedder: Embedder,
+    preset: str | dict | None = "small",
+) -> tuple[str | None, bool]:
     if region.color and region.color_hex:
         color, color_hex = region.color, region.color_hex
     else:
         color, color_hex = dominant_color(region.crop)
-    embedding = [round(float(value), 5) for value in embedder.embed(flatten_for_embed(region.crop))]
+    # The comparison signature stays at the small size, so a later picture-size change does not split duplicates.
+    embedding = [
+        round(float(value), 5)
+        for value in embedder.embed(flatten_for_embed(modest_crop(region.crop, CROP_EDGE)))
+    ]
     match = _find_duplicate(state, region.category, embedding)
     if match is not None:
         sources = match.setdefault("sources", [])
@@ -585,7 +668,7 @@ def _record_region(state: dict, output: Path, source: Path, region: Region, embe
         return match.get("id"), False
     garment_id = uuid.uuid4().hex[:12]
     crop_path = output / "pending" / f"{garment_id}.webp"
-    _save_crop(region.crop, crop_path, output)
+    _save_crop(region.crop, crop_path, output, preset)
     state["garments"][garment_id] = {
         "id": garment_id,
         "status": "pending",
@@ -599,6 +682,7 @@ def _record_region(state: dict, output: Path, source: Path, region: Region, embe
         "friendly": region.friendly,
         "confidence": round(float(region.confidence), 3),
         "crop_path": str(crop_path.resolve()),
+        "crop_box": list(region.crop_box) if region.crop_box else None,
         "sources": [str(source)],
         "embedding": embedding,
         "closet_id": None,
@@ -693,11 +777,11 @@ def _empty_state() -> dict:
     return {"version": 1, "files": {}, "garments": {}}
 
 
-def _save_crop(image: Image.Image, path: Path, output: Path) -> None:
+def _save_crop(image: Image.Image, path: Path, output: Path, preset: str | dict | None = "small") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _require_inside(path, output)
     # The color name and hex were stored before this lossy save.
-    payload = encode_webp(image)
+    payload = encode_webp(image, preset)
     temporary = path.with_name(f".{path.name}.tmp")
     _require_inside(temporary, output)
     temporary.write_bytes(payload)
@@ -736,9 +820,10 @@ def storage_summary(output: Path, items: pd.DataFrame | None = None, root: Path 
     }
 
 
-def reclaim_output(output: Path) -> dict:
-    """Keep one small WebP per piece and delete crop files nothing points at."""
+def reclaim_output(output: Path, preset: str | dict | None = "small") -> dict:
+    """Drop extra crop files and shrink ones that are larger than the chosen size. Never enlarge."""
     output = output.expanduser().resolve()
+    spec = resolve_preset(preset)
     before = _tree_bytes(output)
     state = load_state(output) if (output / LIBRARY_NAME).is_file() else _empty_state()
     referenced: set[Path] = set()
@@ -751,23 +836,11 @@ def reclaim_output(output: Path) -> dict:
         if not path.is_file() or not _is_relative_to(path, output):
             garment["crop_path"] = ""
             continue
-        try:
-            with Image.open(path) as image:
-                image.load()
-                payload = encode_webp(image)
-        except (OSError, UnidentifiedImageError):
+        destination = _downscale_file(path, spec, output)
+        if destination is None:
             _delete_our_file(path, output)
             garment["crop_path"] = ""
             continue
-        destination = path.with_suffix(".webp")
-        size = path.stat().st_size
-        # A small WebP is already the stored picture. Recompressing it can drift the color.
-        if path.suffix.lower() == ".webp" and (size <= 40 * 1024 or size <= len(payload)):
-            referenced.add(path.resolve())
-            continue
-        _save_bytes(destination, payload, output)
-        if destination.resolve() != path.resolve():
-            _delete_our_file(path, output)
         garment["crop_path"] = str(destination.resolve())
         referenced.add(destination.resolve())
     removed = _delete_unreferenced_images(output, referenced)
@@ -783,6 +856,172 @@ def reclaim_output(output: Path) -> dict:
         "crop_count": summary["crop_count"],
         "crop_average": summary["crop_average"],
     }
+
+
+def _long_edge(path: Path) -> int | None:
+    try:
+        with Image.open(path) as image:
+            return max(image.size)
+    except (OSError, UnidentifiedImageError):
+        return None
+
+
+def _downscale_file(path: Path, preset: str | dict, output: Path) -> Path | None:
+    """Rewrite a crop only when it is larger than the preset or not WebP yet. Never enlarge."""
+    spec = resolve_preset(preset)
+    edge = int(spec["edge"])
+    long_edge = _long_edge(path)
+    if long_edge is None:
+        return None
+    if path.suffix.lower() == ".webp" and long_edge <= edge:
+        return path
+    try:
+        with Image.open(path) as image:
+            image.load()
+            payload = encode_webp(image, spec)
+    except (OSError, UnidentifiedImageError):
+        return None
+    destination = path.with_suffix(".webp")
+    _save_bytes(destination, payload, output)
+    if destination.resolve() != path.resolve():
+        _delete_our_file(path, output)
+    return destination
+
+
+def _existing_source(sources: list) -> Path | None:
+    for value in sources or []:
+        path = Path(str(value))
+        if path.is_file():
+            return path
+    return None
+
+
+def _master_crop(source: Path, box: list | tuple, current: Path | None) -> Image.Image:
+    """The garment cut from the original photo, with the saved silhouette if we still have it."""
+    image = _image_from_bytes(source.read_bytes())
+    width, height = image.size
+    try:
+        left, upper, right, lower = [float(value) for value in box]
+    except (TypeError, ValueError):
+        left = upper = 0.0
+        right = lower = 1.0
+    pixel_box = (
+        max(0, int(left * width)),
+        max(0, int(upper * height)),
+        min(width, int(round(right * width))),
+        min(height, int(round(lower * height))),
+    )
+    if pixel_box[2] - pixel_box[0] < 2 or pixel_box[3] - pixel_box[1] < 2:
+        pixel_box = (0, 0, width, height)
+    crop = image.crop(pixel_box).convert("RGBA")
+    if current is not None and current.is_file():
+        try:
+            with Image.open(current) as old:
+                old.load()
+                if "A" in old.getbands():
+                    alpha = old.getchannel("A").resize(crop.size, Image.Resampling.BILINEAR)
+                    crop.putalpha(alpha)
+        except (OSError, UnidentifiedImageError):
+            pass
+    return modest_crop(crop, HIGH_EDGE)
+
+
+def _reencode_source(source: Path, box: list | tuple, current: Path | None, preset: str | dict) -> bytes:
+    """Cut the same garment out of the original photo and save it at the preset. Never enlarge."""
+    return encode_webp(_master_crop(source, box, current), preset)
+
+
+def master_from_garment(garment: dict) -> Image.Image | None:
+    source = _existing_source(garment.get("sources") or [])
+    box = garment.get("crop_box")
+    current = Path(str(garment.get("crop_path") or ""))
+    current = current if current.is_file() else None
+    if source is not None and box:
+        return _master_crop(source, box, current)
+    if current is not None:
+        try:
+            with Image.open(current) as image:
+                image.load()
+                return image.copy()
+        except (OSError, UnidentifiedImageError):
+            return None
+    return None
+
+
+def apply_quality(output: Path, preset: str | dict, root: Path | None = None) -> dict:
+    """Save the picture size. Rebuild a crop from its photo when that file is still there."""
+    spec = save_preset(preset, root)
+    rebuilt = 0
+    kept = 0
+    shrunk = 0
+    output = output.expanduser()
+    if output.exists() and (output / LIBRARY_NAME).is_file():
+        state = load_state(output)
+        for garment in state["garments"].values():
+            if garment.get("status") == "rejected":
+                continue
+            path = Path(str(garment.get("crop_path") or ""))
+            if not path.is_file() or not _is_relative_to(path, output):
+                continue
+            source = _existing_source(garment.get("sources") or [])
+            box = garment.get("crop_box")
+            if source is not None and box:
+                payload = _reencode_source(source, box, path, spec)
+                destination = path.with_suffix(".webp")
+                _save_bytes(destination, payload, output)
+                if destination.resolve() != path.resolve():
+                    _delete_our_file(path, output)
+                garment["crop_path"] = str(destination.resolve())
+                rebuilt += 1
+                continue
+            before_edge = _long_edge(path)
+            updated = _downscale_file(path, spec, output)
+            if updated is None:
+                garment["crop_path"] = ""
+                continue
+            after_edge = _long_edge(updated)
+            if before_edge and after_edge and after_edge < before_edge:
+                shrunk += 1
+            else:
+                kept += 1
+            garment["crop_path"] = str(updated.resolve())
+        save_state(output, state)
+    return {"preset": spec["id"], "rebuilt": rebuilt, "kept": kept, "shrunk": shrunk}
+
+
+def sample_outfit() -> list[tuple[str, Image.Image]]:
+    pieces = []
+    if not SAMPLE_DIR.is_dir():
+        return pieces
+    for path in sorted(SAMPLE_DIR.glob("*")):
+        if path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        try:
+            with Image.open(path) as image:
+                image.load()
+                pieces.append((path.stem.replace("-", " ").title(), image.copy()))
+        except (OSError, UnidentifiedImageError):
+            continue
+    return pieces
+
+
+def preview_rows(images: list[Image.Image]) -> list[dict]:
+    """Encode the same pictures at every preset. A small source is not enlarged."""
+    rows = []
+    for spec in PRESET_LIST:
+        payloads = [encode_webp(image, spec) for image in images]
+        average = int(round(sum(len(payload) for payload in payloads) / len(payloads))) if payloads else 0
+        rows.append({
+            "id": spec["id"],
+            "label": spec["label"],
+            "aim": spec["aim"],
+            "edge": spec["edge"],
+            "payloads": payloads,
+            "sizes": [len(payload) for payload in payloads],
+            "average": average,
+            "planning": projection_line(average, 1000),
+        })
+    return rows
 
 
 def _tree_bytes(path: Path) -> int:
@@ -849,11 +1088,11 @@ def _require_inside(path: Path, root: Path) -> None:
         raise PhotoImportError("Refusing to write outside the crops folder.") from exc
 
 
-def _tight_crop(original: Image.Image, mask: np.ndarray) -> Image.Image | None:
+def _tight_crop(original: Image.Image, mask: np.ndarray) -> tuple[Image.Image | None, tuple[float, float, float, float] | None]:
     """Cut just around the garment and leave everything else transparent."""
     fitted = _fit_mask(mask, original.size)
     if not fitted.any():
-        return None
+        return None, None
     ys, xs = np.where(fitted)
     y0, y1 = int(ys.min()), int(ys.max()) + 1
     x0, x1 = int(xs.min()), int(xs.max()) + 1
@@ -865,11 +1104,14 @@ def _tight_crop(original: Image.Image, mask: np.ndarray) -> Image.Image | None:
     right = min(width, x1 + pad_x)
     lower = min(height, y1 + pad_y)
     if right - left < 48 or lower - upper < 48:
-        return None
+        return None, None
     crop = original.crop((left, upper, right, lower)).convert("RGBA")
     alpha = Image.fromarray(np.where(fitted[upper:lower, left:right], np.uint8(255), np.uint8(0)), mode="L")
     crop.putalpha(alpha)
-    return modest_crop(crop)
+    width, height = original.size
+    box = (left / width, upper / height, right / width, lower / height)
+    # Keep enough detail to re-save at High. The chosen preset is applied when the file is written.
+    return modest_crop(crop, HIGH_EDGE), box
 
 
 def _crop_original(original: Image.Image, box: tuple[int, int, int, int], scale_x: float, scale_y: float) -> Image.Image | None:
@@ -980,14 +1222,16 @@ def _region_from_component(
     scale_y: float,
     person_box: tuple[int, int, int, int],
     friendly: str | None = None,
+    color_image: Image.Image | None = None,
 ) -> Region | None:
     category, folder, guessed, confidence = classify_label(label_name, box, person_box)
     usable = component & ~skin
     if not np.any(usable):
         usable = component
+    measured_on = color_image or original
     # Measure the color on the uncompressed mask. The WebP file is written later.
-    color, color_hex = dominant_color(original, _fit_mask(usable, original.size))
-    crop = _tight_crop(original, usable)
+    color, color_hex = dominant_color(measured_on, _fit_mask(usable, measured_on.size))
+    crop, crop_box = _tight_crop(original, usable)
     if crop is None:
         return None
     return Region(
@@ -999,6 +1243,7 @@ def _region_from_component(
         confidence,
         color,
         color_hex,
+        crop_box,
     )
 
 
@@ -1125,6 +1370,7 @@ def _cli(argv: list[str] | None = None) -> int:
             finder,
             embedder,
             limit=args.limit,
+            preset=current_preset(),
         )
         for update in updates:
             print(update.message, flush=True)

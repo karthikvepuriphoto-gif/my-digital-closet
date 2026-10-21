@@ -407,7 +407,7 @@ def resolve_image(path: object, root: Path) -> Path | None:
     return None
 
 
-def store_photo(data: bytes, item_id: int, root: Path) -> str:
+def store_photo(data: bytes, item_id: int, root: Path, preset: str | None = None) -> str:
     try:
         image = Image.open(io.BytesIO(data))
         image.load()
@@ -421,13 +421,15 @@ def store_photo(data: bytes, item_id: int, root: Path) -> str:
     # A new filename keeps the browser from showing a replaced photo.
     filename = f"item_{int(item_id)}_{time.time_ns() // 1_000_000}.webp"
     destination = folder / filename
-    destination.write_bytes(pi.encode_webp(image))
+    destination.write_bytes(pi.encode_webp(image, preset or "small"))
     return f"{IMAGE_DIR_NAME}/{filename}"
 
 
-def reclaim_closet_photos(items: pd.DataFrame, root: Path) -> tuple[pd.DataFrame, int]:
-    """Rewrite closet photos that live in closet_images as one small WebP each."""
+def reclaim_closet_photos(items: pd.DataFrame, root: Path, preset: str | None = None) -> tuple[pd.DataFrame, int]:
+    """Shrink closet photos that live in closet_images down to the chosen size. Never enlarge."""
     import photo_import as pi
+
+    spec = pi.resolve_preset(preset or "small")
 
     if items.empty or "Image_Path" not in items.columns:
         return items.copy(), 0
@@ -442,13 +444,13 @@ def reclaim_closet_photos(items: pd.DataFrame, root: Path) -> tuple[pd.DataFrame
         try:
             with Image.open(resolved) as image:
                 image.load()
-                payload = pi.encode_webp(pi.prepare_photo(image))
+                long_edge = max(image.size)
+                if resolved.suffix.lower() == ".webp" and long_edge <= int(spec["edge"]):
+                    continue
+                payload = pi.encode_webp(pi.prepare_photo(image), spec)
         except (UnidentifiedImageError, OSError):
             continue
         destination = resolved.with_suffix(".webp")
-        # A small WebP is already the stored picture. Recompressing it can drift the color.
-        if resolved.suffix.lower() == ".webp" and (before <= 40 * 1024 or before <= len(payload)):
-            continue
         if destination.exists() and destination.resolve() != resolved.resolve():
             destination = folder / f"{resolved.stem}-{time.time_ns() // 1_000_000}.webp"
         destination.write_bytes(payload)

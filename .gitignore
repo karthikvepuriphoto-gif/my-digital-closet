@@ -5,6 +5,7 @@ __pycache__/
 wardrobe_db.csv
 outfits_db.csv
 closet_images/
+storage_prefs.json
 imported_wardrobe/
 model_cache/
 *.tmp
