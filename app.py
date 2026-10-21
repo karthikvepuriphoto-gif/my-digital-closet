@@ -448,7 +448,7 @@ def page_add(items: pd.DataFrame, outfits: pd.DataFrame) -> None:
             "Photo",
             type=["png", "jpg", "jpeg"],
             key=f"add_photo_{nonce}",
-            help="JPG or PNG. Large photos are resized.",
+            help="JPG, PNG, or WebP. The saved photo is a small WebP.",
         )
         if photo is not None:
             st.image(photo, width="stretch")
@@ -1013,6 +1013,7 @@ def page_import(items: pd.DataFrame, outfits: pd.DataFrame) -> None:
             "Photo import needs PyTorch on this computer. The rest of the closet keeps working without it.",
         )
         st.code(import_models.INSTALL_HINT, language="bash")
+        _render_storage(items, pi.DEFAULT_OUTPUT)
         return
 
     if "import_output" not in st.session_state:
@@ -1041,6 +1042,7 @@ def page_import(items: pd.DataFrame, outfits: pd.DataFrame) -> None:
         )
         if st.button("Download models", type="primary", key="download_models"):
             _download_import_models()
+        _render_storage(items, output)
         return
 
     st.caption("Model is on this computer. This scan does not upload photos or phone home.")
@@ -1064,6 +1066,7 @@ def page_import(items: pd.DataFrame, outfits: pd.DataFrame) -> None:
 
     items = _sync_import_links(items, output)
     _render_import_review(items, outfits, output)
+    _render_storage(items, output)
 
 
 def _download_import_models() -> None:
@@ -1307,6 +1310,62 @@ def _approve_all_pending(
     else:
         noun = "piece" if added == 1 else "pieces"
         st.session_state["flash"] = ("ok", f"Added {added} {noun} to the closet.")
+    st.rerun()
+
+
+def _format_bytes(size: int) -> str:
+    amount = max(0, int(size))
+    if amount < 1024:
+        return f"{amount} B"
+    if amount < 1024 * 1024:
+        kb = amount / 1024
+        return f"{kb:.1f} KB" if kb < 10 else f"{kb:.0f} KB"
+    return f"{amount / (1024 * 1024):.1f} MB"
+
+
+def _render_storage(items: pd.DataFrame, output: Path) -> None:
+    summary = pi.storage_summary(output, items, w.APP_DIR)
+    st.subheader("Storage")
+    st.caption(
+        "Each piece keeps one small WebP. The color name and hex are saved before that picture is compressed. "
+        "Original photos are referenced by path and are not copied."
+    )
+    crops, closet = st.columns(2)
+    with crops:
+        st.metric("Saved crops", _format_bytes(summary["crop_bytes"]))
+        if summary["crop_count"]:
+            st.caption(f"{summary['crop_count']} files · {_format_bytes(summary['crop_average'])} average")
+        else:
+            st.caption("No saved crops")
+    with closet:
+        st.metric("Closet photos", _format_bytes(summary["closet_bytes"]))
+        if summary["closet_count"]:
+            st.caption(f"{summary['closet_count']} photos · {_format_bytes(summary['closet_average'])} average")
+        else:
+            st.caption("No closet photos")
+    st.caption(
+        "Clean up keeps one small WebP per piece, drops extra files in the crops folder, "
+        "and shrinks photos that live in closet_images. Pictures outside that folder stay where they are."
+    )
+    if st.button("Clean up and reclaim space", key="reclaim_space"):
+        _reclaim_space(items, output)
+
+
+def _reclaim_space(items: pd.DataFrame, output: Path) -> None:
+    try:
+        crops = pi.reclaim_output(output) if output.exists() else {"freed": 0, "crop_count": 0, "crop_average": 0}
+        updated, closet_freed = w.reclaim_closet_photos(items, w.APP_DIR)
+        if not updated.equals(items):
+            w.save_items(updated, w.ITEMS_PATH)
+        freed = int(crops.get("freed", 0)) + int(closet_freed)
+        st.session_state["flash"] = (
+            "ok",
+            f"Reclaimed {_format_bytes(freed)}. "
+            f"{int(crops.get('crop_count', 0))} crop files, "
+            f"{_format_bytes(int(crops.get('crop_average', 0)))} average.",
+        )
+    except (pi.PhotoImportError, w.WardrobeError) as exc:
+        st.session_state["flash"] = ("err", str(exc))
     st.rerun()
 
 

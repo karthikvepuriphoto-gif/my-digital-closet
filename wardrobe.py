@@ -416,14 +416,55 @@ def store_photo(data: bytes, item_id: int, root: Path) -> str:
     import photo_import as pi
 
     image = pi.prepare_photo(image)
-    image.thumbnail((1400, 1400))
     folder = root / IMAGE_DIR_NAME
     folder.mkdir(parents=True, exist_ok=True)
     # A new filename keeps the browser from showing a replaced photo.
-    filename = f"item_{int(item_id)}_{time.time_ns() // 1_000_000}.png"
+    filename = f"item_{int(item_id)}_{time.time_ns() // 1_000_000}.webp"
     destination = folder / filename
-    image.save(destination, "PNG")
+    destination.write_bytes(pi.encode_webp(image))
     return f"{IMAGE_DIR_NAME}/{filename}"
+
+
+def reclaim_closet_photos(items: pd.DataFrame, root: Path) -> tuple[pd.DataFrame, int]:
+    """Rewrite closet photos that live in closet_images as one small WebP each."""
+    import photo_import as pi
+
+    if items.empty or "Image_Path" not in items.columns:
+        return items.copy(), 0
+    items = items.copy()
+    folder = root / IMAGE_DIR_NAME
+    freed = 0
+    for index, row in items.iterrows():
+        resolved = resolve_image(row["Image_Path"], root)
+        if resolved is None or not _is_inside(resolved, folder):
+            continue
+        before = resolved.stat().st_size
+        try:
+            with Image.open(resolved) as image:
+                image.load()
+                payload = pi.encode_webp(pi.prepare_photo(image))
+        except (UnidentifiedImageError, OSError):
+            continue
+        destination = resolved.with_suffix(".webp")
+        # A small WebP is already the stored picture. Recompressing it can drift the color.
+        if resolved.suffix.lower() == ".webp" and (before <= 40 * 1024 or before <= len(payload)):
+            continue
+        if destination.exists() and destination.resolve() != resolved.resolve():
+            destination = folder / f"{resolved.stem}-{time.time_ns() // 1_000_000}.webp"
+        destination.write_bytes(payload)
+        if destination.resolve() != resolved.resolve() and resolved.is_file():
+            resolved.unlink()
+        items.at[index, "Image_Path"] = f"{IMAGE_DIR_NAME}/{destination.name}"
+        freed += max(0, before - len(payload))
+    return items, freed
+
+
+def _is_inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def remove_stored_photo(path: object, root: Path, items: pd.DataFrame | None = None) -> None:

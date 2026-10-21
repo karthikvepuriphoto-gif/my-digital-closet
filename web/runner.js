@@ -1,7 +1,7 @@
 /** One-photo-at-a-time scan. Each finished photo is saved before the next one starts. */
 
 import { findDuplicate } from "./closet.js";
-import { deleteRecord, getRecord, inboxHas, putRecord, readAll, readInbox, writeInbox } from "./db.js";
+import { deleteRecord, getRecord, putRecord, readAll, readInbox } from "./db.js";
 import {
   COOLDOWN_MS,
   THERMAL_WAIT_MS,
@@ -97,34 +97,31 @@ export function bindRunner(ctx) {
   }
 
   async function sourceFile(entry) {
-    const stored = await readInbox(entry.key, entry.lastModified);
-    if (stored) return stored;
     const live = liveFiles.get(entry.key);
     if (live) return live;
-    return fileFromDirectory(entry.relativePath);
+    const fromFolder = await fileFromDirectory(entry.relativePath);
+    if (fromFolder) return fromFolder;
+    // Older builds stored a copy of the original. Use it once, then the sweep deletes it.
+    return readInbox(entry.key, entry.lastModified);
   }
 
   async function scanOne(entry) {
-    let source = await sourceFile(entry);
+    const source = await sourceFile(entry);
     if (!source) {
       await rememberEntry(markNeedsFile(entry));
       return "halt";
     }
     const before = `${source.size}:${source.lastModified}`;
-    if (!(await inboxHas(entry.key))) {
-      await writeInbox(entry.key, source);
-      if (`${source.size}:${source.lastModified}` !== before) {
-        throw new Error(`${entry.name} changed while it was being read. Stopped.`);
-      }
-      source = await readInbox(entry.key, entry.lastModified);
-    }
-    await rememberEntry(markReading({ ...entry, stored: true }));
+    await rememberEntry(markReading({ ...entry, stored: false }));
     await publish(progressText(entry.name).label, "work");
     let error = "";
     const garmentIds = [];
     let created = 0;
     try {
       const regions = await findGarments(source);
+      if (`${source.size}:${source.lastModified}` !== before) {
+        throw new Error(`${entry.name} changed while it was being read. Stopped.`);
+      }
       for (const region of regions) {
         const match = findDuplicate(state.garments, region.category, region.embedding);
         if (match) {
@@ -164,7 +161,7 @@ export function bindRunner(ctx) {
       ? markError(entry, error, stamp())
       : markDone({ ...entry, stored: true }, garmentIds, stamp());
     await rememberEntry(finished);
-    await deleteRecord("inbox", entry.key);
+    await deleteRecord("inbox", entry.key).catch(() => {});
     await putRecord("scans", {
       key: entry.key,
       error,
@@ -206,14 +203,7 @@ export function bindRunner(ctx) {
 
   async function sweepInbox() {
     const rows = await readAll("inbox");
-    const keep = new Set(
-      state.queue
-        .filter((entry) => entry.status === "queued" || entry.status === "reading" || entry.status === "needs-file")
-        .map((entry) => entry.key),
-    );
-    for (const row of rows) {
-      if (!keep.has(row.key)) await deleteRecord("inbox", row.key);
-    }
+    for (const row of rows) await deleteRecord("inbox", row.key);
   }
 
   async function runLoop() {
@@ -339,19 +329,10 @@ export function bindRunner(ctx) {
         continue;
       }
       liveFiles.set(entry.key, file);
-      state.progress = `Saving photo ${index + 1} of ${files.length} on this phone so the scan can continue. Originals are untouched.`;
-      state.progressValue = files.length ? index / files.length : 0;
-      render();
-      await new Promise((resolve) => setTimeout(resolve, 0));
-      const before = `${file.size}:${file.lastModified}`;
-      await writeInbox(entry.key, file);
-      if (`${file.size}:${file.lastModified}` !== before) {
-        throw new Error(`${file.name} changed while it was being saved. Stopped.`);
-      }
       await rememberEntry({
         ...entry,
         status: "queued",
-        stored: true,
+        stored: false,
         error: "",
         garmentIds: existing?.garmentIds || [],
         scannedAt: "",
@@ -461,7 +442,7 @@ export function bindRunner(ctx) {
           continue;
         }
         await deleteRecord("queue", entry.key);
-        await deleteRecord("inbox", entry.key);
+        await deleteRecord("inbox", entry.key).catch(() => {});
         liveFiles.delete(entry.key);
       }
       state.queue = keep;

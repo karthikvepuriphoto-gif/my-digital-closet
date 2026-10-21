@@ -20,17 +20,19 @@ Open **Import**. Choose photos, a folder (Chrome on Android and on a computer), 
 
 That download is the model files only. The photos are not part of the request, and they are not sent to a vision API. Later scans use the cached models and run on the phone.
 
-Photos do not need to stay large. Each one is turned upright, converted to sRGB, and shrunk to about 640 pixels on the long side before clothes are found. Crops are saved as PNG at about 512 pixels, so a JPEG save does not shift the color. The color is measured from the garment pixels only — not the background or skin — on that 640-pixel photo, using k-means in CIELAB. You see a readable name, such as Blue, and the measured hex.
+Photos do not need to stay large. Each one is turned upright, converted to sRGB, and shrunk to about 640 pixels on the long side before clothes are found. The color is measured from the garment pixels only — not the background or skin — on that 640-pixel photo, using k-means in CIELAB. You see a readable name, such as Blue, and the measured hex. That name and hex are saved before the picture is compressed, so the color does not depend on the stored file. The saved crop is a tight cutout of the garment on a plain background, about 384 pixels on the long side, as a small WebP. The closet shows that one picture. It does not keep a second thumbnail or a copy of the original photo.
 
 The scan is built to run slowly and to keep what it has already finished:
 
-- Each photo is saved in the on-device queue before the next one starts. A private copy of a picked photo is kept until that photo finishes, then the copy is deleted. The original file is never changed.
+- The queue remembers each photo by its path, size, and time. It does not store a copy of the original. If you picked individual files and then closed the page, those files have to be chosen again. A folder you already allowed can be read again. Finished pieces stay finished. The original file is never changed.
 - **Scan next 4** does a short batch. **Scan all remaining** keeps going. **Stop after this photo** finishes the one in progress and leaves the rest queued.
 - There is a short pause between photos so the phone can cool down. **Only scan while charging** waits when the phone is unplugged. Chrome and the Play app can see the charger. iPhone’s browser cannot, so that switch does not block a scan in Safari.
 - **Keep the screen on during the scan** uses the screen wake lock while the app is open. It is off unless you turn it on.
 - If the page is closed mid-scan, opening it again continues from the last finished photo. On iPhone the system pauses work in the background; the checkpoint is what makes it continue. Finished photos are not scanned again.
 
 Nothing is added to the closet until you approve it. You can fix the name, category, color, and season first. A dress is stored as **Full Body** so a look can treat it as a one-piece, and its crop file goes in `dresses/`. The segmenter has no coat class, so a long top is only a suggestion of outerwear. Rejecting a guess drops the crop and remembers the signature. It does not delete the original photo, because the app never has permission to change files you did not pick as a save destination.
+
+**Settings** shows how much space the closet files use and the average size of a piece photo. **Clean up and reclaim space** deletes leftover copies of original photos from older versions of the app, drops a second crop when the piece already has one, and shrinks pictures that are still large. Names and colors stay as they are.
 
 **Download crops (.zip)** saves approved photos in folders named `tops`, `bottoms`, `dresses`, `outerwear`, `shoes`, and `accessories`. In Chrome, **Save crops to a folder** writes those same folders into a directory you choose. Safari on iPhone can use the zip.
 
@@ -61,7 +63,7 @@ node --test web/closet.test.js
 
 ### Computer photo import
 
-On the computer, **Import** reads a folder path. Crops go to a separate folder, never inside the photo folder. The computer models are SegFormer B2 and MobileNetV3-Small, saved in `model_cache/`. Originals are only read, telemetry from the model tools is turned off, and a scan can be resumed. Photos are shrunk to about 640 pixels before the model runs, crops are PNG at about 512 pixels, and the color is the garment’s measured name plus hex.
+On the computer, **Import** reads a folder path. Crops go to a separate folder, never inside the photo folder. The computer models are SegFormer B2 and MobileNetV3-Small, saved in `model_cache/`. Originals are only read, telemetry from the model tools is turned off, and a scan can be resumed. Photos are shrunk to about 640 pixels before the model runs. Each crop is one WebP of about 384 pixels, and the color is the garment’s measured name plus hex, saved before the file is compressed. The same page shows how much those crops and the closet photos use, and **Clean up and reclaim space** keeps one small WebP per piece. Photos that do not live in `closet_images/` are left alone.
 
 ```bash
 python photo_import.py download-models

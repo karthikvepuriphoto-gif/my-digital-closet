@@ -85,8 +85,11 @@ class PhotoImportTests(unittest.TestCase):
             self.assertEqual(photo.read_bytes(), before)
             self.assertEqual(photo.stat().st_mtime_ns, signature)
             self.assertEqual(updates[-1].found, 1)
-            pending = list((output / "pending").glob("*.png"))
+            pending = list((output / "pending").glob("*.webp"))
             self.assertEqual(len(pending), 1)
+            payload = pending[0].read_bytes()
+            self.assertTrue(payload.startswith(b"RIFF") and b"WEBP" in payload[:12])
+            self.assertLessEqual(pending[0].stat().st_size, 40 * 1024)
             self.assertTrue(pi._is_relative_to(pending[0], output))
             state = pi.load_state(output)
             self.assertEqual(state["files"][str(photo.resolve())]["error"], "")
@@ -195,6 +198,9 @@ class PhotoImportTests(unittest.TestCase):
             matched = [row for row in pending if len(row["sources"]) == 2][0]
             self.assertEqual(matched["color"], "Red")
             self.assertCountEqual(matched["sources"], [str(photos[0].resolve()), str(photos[1].resolve())])
+            crops = list(output.rglob("*.webp"))
+            self.assertEqual(len(crops), 2)
+            self.assertEqual(len({path.resolve() for path in crops}), len(pending))
             again = list(pi.scan_folder(source, output, finder, embedder))
             self.assertEqual(again[0].total, 0)
             self.assertEqual(finder.calls, 3)
@@ -287,6 +293,7 @@ class PhotoImportTests(unittest.TestCase):
             photo = _photo(source, "live.png")
             with self.assertRaises(pi.PhotoImportError):
                 list(pi.scan_folder(source, output, MutatingFinder(photo), MeanEmbedder()))
+            self.assertEqual(list((output / "pending").glob("*.webp")), [])
             self.assertEqual(list((output / "pending").glob("*.png")), [])
             self.assertEqual(pi.load_state(output)["files"], {})
 
@@ -345,7 +352,19 @@ class PhotoImportTests(unittest.TestCase):
         self.assertEqual(len(regions), 1)
         self.assertEqual(regions[0].color, "Red")
         self.assertTrue(regions[0].color_hex.startswith("#"))
-        self.assertLessEqual(max(regions[0].crop.size), pi.CROP_EDGE)
+        crop = regions[0].crop
+        self.assertEqual(crop.mode, "RGBA")
+        self.assertLessEqual(max(crop.size), pi.CROP_EDGE)
+        alpha = np.asarray(crop.getchannel("A"))
+        self.assertEqual(int(alpha[alpha.shape[0] // 2, alpha.shape[1] // 2]), 0)
+        opaque = alpha > 200
+        self.assertTrue(np.any(opaque))
+        reds = np.asarray(crop.convert("RGB"))[opaque]
+        self.assertGreater(float(reds[:, 0].mean()), 150)
+        self.assertLess(float(reds[:, 1].mean()), 80)
+        encoded = pi.encode_webp(crop)
+        self.assertTrue(encoded.startswith(b"RIFF") and b"WEBP" in encoded[:12])
+        self.assertLessEqual(len(encoded), 40 * 1024)
 
         wide_array = np.full((1200, 1800, 3), 245, dtype=np.uint8)
         wide_array[100:1100, 100:1700] = (180, 40, 40)
@@ -377,6 +396,33 @@ class PhotoImportTests(unittest.TestCase):
         self.assertEqual(restored.mode, "RGB")
         center = restored.getpixel((4, 4))
         self.assertLess(max(abs(left - right) for left, right in zip(center, (180, 40, 40))), 8)
+
+    def test_reclaim_keeps_one_webp_and_drops_extra_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            _photo(source, "day.png")
+            list(pi.scan_folder(source, output, ScriptedFinder([[_region()]]), MeanEmbedder()))
+            orphan = output / "pending" / "extra.png"
+            Image.new("RGB", (64, 64), (10, 10, 10)).save(orphan, "PNG")
+            outside = root / "original.png"
+            Image.new("RGB", (32, 32), (1, 2, 3)).save(outside, "PNG")
+            before = pi.storage_summary(output)
+            self.assertEqual(before["crop_count"], 1)
+            self.assertLessEqual(before["crop_average"], 40 * 1024)
+            result = pi.reclaim_output(output)
+            self.assertFalse(orphan.exists())
+            self.assertTrue(outside.is_file())
+            self.assertGreaterEqual(result["freed"], 0)
+            self.assertEqual(result["crop_count"], 1)
+            kept = list(output.rglob("*.webp"))
+            self.assertEqual(len(kept), 1)
+            self.assertLessEqual(kept[0].stat().st_size, 40 * 1024)
+            again = pi.reclaim_output(output)
+            self.assertEqual(again["crop_count"], 1)
+            self.assertEqual(len(list(output.rglob("*.webp"))), 1)
 
     def test_models_are_not_loaded_until_they_exist_locally(self):
         with tempfile.TemporaryDirectory() as tmp:

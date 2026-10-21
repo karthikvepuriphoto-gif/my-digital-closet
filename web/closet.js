@@ -204,7 +204,7 @@ export function itemsToCsv(items) {
       "Sub-Category": item.name,
       "Primary Color": item.color,
       Season: item.season,
-      Image_Path: item.imageBlob ? `closet_images/item_${item.id}.png` : "",
+      Image_Path: item.imageBlob ? `closet_images/item_${item.id}.${item.imageBlob.type === "image/webp" ? "webp" : "png"}` : "",
       Source_Photo: item.sourcePhoto || "",
       Source_Photos: item.sourcePhotos || "",
       ...(item.extra || {}),
@@ -738,14 +738,50 @@ export function scaledCropBox(box, maskWidth, maskHeight, imageWidth, imageHeigh
   let top = y0 * scaleY;
   let right = x1 * scaleX;
   let bottom = y1 * scaleY;
-  const padX = (right - left) * 0.08;
-  const padY = (bottom - top) * 0.08;
+  const padX = Math.max(2, (right - left) * 0.02);
+  const padY = Math.max(2, (bottom - top) * 0.02);
   left = Math.max(0, Math.floor(left - padX));
   top = Math.max(0, Math.floor(top - padY));
   right = Math.min(imageWidth, Math.ceil(right + padX));
   bottom = Math.min(imageHeight, Math.ceil(bottom + padY));
   if (right - left < 48 || bottom - top < 48) return null;
   return [left, top, right, bottom];
+}
+
+export function storageReport({ items = [], garments = [], inbox = [] } = {}) {
+  const pieceSizes = items.map((item) => item.imageBlob?.size || 0).filter((size) => size > 0);
+  const reviewSizes = garments
+    .filter((garment) => garment.status === "pending")
+    .map((garment) => garment.cropBlob?.size || 0)
+    .filter((size) => size > 0);
+  const extraSizes = garments
+    .filter((garment) => garment.status !== "pending")
+    .map((garment) => garment.cropBlob?.size || 0)
+    .filter((size) => size > 0);
+  const originalSizes = inbox.map((row) => row.blob?.size || row.size || 0).filter((size) => size > 0);
+  const sum = (values) => values.reduce((total, value) => total + value, 0);
+  const average = (values) => (values.length ? Math.round(sum(values) / values.length) : 0);
+  return {
+    pieceBytes: sum(pieceSizes),
+    pieceCount: pieceSizes.length,
+    averageBytes: average(pieceSizes),
+    reviewBytes: sum(reviewSizes),
+    reviewCount: reviewSizes.length,
+    extraBytes: sum(extraSizes),
+    originalBytes: sum(originalSizes),
+    originalCount: originalSizes.length,
+    totalBytes: sum(pieceSizes) + sum(reviewSizes) + sum(extraSizes) + sum(originalSizes),
+  };
+}
+
+export function formatBytes(bytes) {
+  const size = Math.max(0, Number(bytes) || 0);
+  if (size < 1024) return `${Math.round(size)} B`;
+  if (size < 1024 * 1024) {
+    const kb = size / 1024;
+    return `${kb >= 10 ? kb.toFixed(0) : kb.toFixed(1)} KB`;
+  }
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export function swatchColor(color) {

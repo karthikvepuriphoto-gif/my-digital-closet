@@ -17,17 +17,21 @@ import {
   scrubOutfits,
   sortItems,
   suggestLookName,
+  formatBytes,
+  storageReport,
   swatchColor,
   validateOutfit,
 } from "./closet.js";
-import { clearStore, deleteRecord, loadCloset, putRecord } from "./db.js";
+import { clearStore, deleteRecord, loadCloset, putRecord, readAll } from "./db.js";
 import { bindRunner } from "./runner.js";
 import { describeProgress } from "./scan-session.js";
+import { shrinkStoredPhoto } from "./vision.js";
 
 const state = {
   items: [],
   outfits: [],
   garments: [],
+  inbox: [],
   scans: [],
   files: [],
   screen: "closet",
@@ -319,8 +323,8 @@ function renderImport() {
   return `
     ${banner()}
     <h2>Import from photos</h2>
-    <p class="lede">Pick pictures already on this phone. The scan saves each finished photo before the next one, so leaving the app does not throw that work away. Photos are shrunk before the scan, and the color is read from the garment itself.</p>
-    <div class="banner ok">Your pictures stay on this phone. The scan only reads them. It does not upload them. A private copy is kept until that photo is finished, then the copy is removed. The original is never changed. <a class="link" href="./privacy.html">Privacy</a></div>
+    <p class="lede">Pick pictures already on this phone. Finished pieces are kept. The original photos are not copied onto the phone.</p>
+    <div class="banner ok">Your pictures stay where they are. The scan only reads them. It does not upload them and it does not keep a copy. The color is saved before the small picture is compressed. <a class="link" href="./privacy.html">Privacy</a> · <a class="link" href="#settings">Storage</a></div>
     <div class="stack">
       <label class="file button">Choose photos<input id="pick-photos" type="file" accept="image/*" multiple></label>
       ${folderPick}
@@ -381,6 +385,27 @@ function renderPiece() {
     <p class="meta">${escapeHtml(metaLine(item))}</p>`;
 }
 
+function renderSettings() {
+  const report = storageReport({ items: state.items, garments: state.garments, inbox: state.inbox });
+  const estimate = state.storageEstimate?.usage;
+  const average = report.pieceCount ? `${formatBytes(report.averageBytes)} average` : "No piece photos yet";
+  return `
+    ${banner()}
+    <h2>Settings</h2>
+    <p class="lede">Photos you pick are not copied. Each piece keeps one small picture, and its color is saved separately.</p>
+    <div class="metrics">
+      <div class="metric"><b>${formatBytes(report.totalBytes)}</b>Closet files</div>
+      <div class="metric"><b>${formatBytes(report.averageBytes)}</b>Average per piece</div>
+    </div>
+    <p class="meta">${report.pieceCount ? `${word(report.pieceCount, "piece photo", "piece photos")} · ${average}` : "No piece photos yet."}</p>
+    <p class="meta">${report.reviewCount ? `${word(report.reviewCount, "crop", "crops")} waiting for review · ${formatBytes(report.reviewBytes)}` : "Nothing waiting for review."}</p>
+    <p class="meta">${report.originalCount ? `${word(report.originalCount, "saved copy", "saved copies")} of original photos · ${formatBytes(report.originalBytes)}` : "No copies of original photos."}</p>
+    ${report.extraBytes ? `<p class="meta">Extra crops still stored · ${formatBytes(report.extraBytes)}</p>` : ""}
+    ${estimate != null ? `<p class="hint">This site is using ${formatBytes(estimate)} of browser storage, including the app itself.</p>` : ""}
+    <p class="hint">Clean up removes saved copies of original photos, drops a second crop when the piece already has one, and shrinks pictures that are still large. Names and colors stay as they are.</p>
+    <button class="primary" type="button" data-action="reclaim">Clean up and reclaim space</button>`;
+}
+
 const views = {
   closet: renderCloset,
   add: renderAdd,
@@ -388,6 +413,7 @@ const views = {
   insights: renderInsights,
   import: renderImport,
   piece: renderPiece,
+  settings: renderSettings,
 };
 
 function render() {
@@ -397,7 +423,7 @@ function render() {
   const tally = `${word(state.items.length, "piece", "pieces")} · ${word(state.outfits.length, "look", "looks")}`;
   document.querySelector("#counts").textContent = state.progress ? state.progress : tally;
   document.querySelector("#screen").innerHTML = (views[state.screen] || renderCloset)();
-  for (const link of document.querySelectorAll(".tabbar a")) {
+  for (const link of document.querySelectorAll(".tabbar a, #settings-link")) {
     const on = link.getAttribute("href") === `#${state.screen}`;
     if (on) link.setAttribute("aria-current", "page");
     else link.removeAttribute("aria-current");
@@ -476,7 +502,7 @@ async function onAdd(form) {
     name: name.slice(0, 80),
     color: data.get("color"),
     season: data.get("season"),
-    imageBlob: photo && photo.size ? photo : null,
+    imageBlob: photo && photo.size ? await shrinkStoredPhoto(photo) : null,
     sourcePhoto: "",
     sourcePhotos: "",
     created: new Date().toISOString(),
@@ -504,7 +530,7 @@ async function onEdit(form) {
     category: data.get("category"),
     color: data.get("color"),
     season: data.get("season"),
-    imageBlob: photo && photo.size ? photo : item.imageBlob,
+    imageBlob: photo && photo.size ? await shrinkStoredPhoto(photo) : item.imageBlob,
   };
   if (next.color !== item.color && next.extra?.["Color Hex"]) {
     next.extra = { ...next.extra };
@@ -590,7 +616,7 @@ async function approvePrepared(garment) {
     extra: safeHex(garment.colorHex) ? { "Color Hex": safeHex(garment.colorHex) } : {},
   };
   await saveItem(item);
-  await saveGarment({ ...garment, status: "approved", closetId: item.id, cropBlob: garment.cropBlob });
+  await saveGarment({ ...garment, status: "approved", closetId: item.id, cropBlob: null });
   flash("ok", `Added ${item.name} to the closet.`);
   render();
 }
@@ -613,6 +639,12 @@ async function zipFiles(files) {
   return new Blob([zipped], { type: "application/zip" });
 }
 
+function imageExtension(blob) {
+  if (blob?.type === "image/webp") return "webp";
+  if (blob?.type === "image/jpeg") return "jpg";
+  return "png";
+}
+
 function downloadBlob(blob, name) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
@@ -620,6 +652,45 @@ function downloadBlob(blob, name) {
   link.download = name;
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function reclaimSpace() {
+  await loadInbox();
+  const before = storageReport({ items: state.items, garments: state.garments, inbox: state.inbox }).totalBytes;
+  await clearStore("inbox");
+  state.inbox = [];
+  for (const garment of state.garments) {
+    if (garment.status !== "pending") {
+      if (!garment.cropBlob) continue;
+      garment.cropBlob = null;
+      await saveGarment(garment);
+      continue;
+    }
+    if (!garment.cropBlob) continue;
+    const smaller = await shrinkStoredPhoto(garment.cropBlob);
+    if (smaller.size < garment.cropBlob.size) {
+      garment.cropBlob = smaller;
+      await saveGarment(garment);
+    }
+  }
+  for (const item of state.items) {
+    if (!item.imageBlob) continue;
+    const smaller = await shrinkStoredPhoto(item.imageBlob);
+    if (smaller.size < item.imageBlob.size) {
+      item.imageBlob = smaller;
+      await saveItem(item);
+    }
+  }
+  const report = storageReport({ items: state.items, garments: state.garments, inbox: state.inbox });
+  const freed = Math.max(0, before - report.totalBytes);
+  const average = report.pieceCount ? ` Photos average ${formatBytes(report.averageBytes)} each.` : "";
+  flash("ok", freed ? `Freed ${formatBytes(freed)}.${average}` : `Nothing extra to remove.${average}`);
+  if (navigator.storage?.estimate) state.storageEstimate = await navigator.storage.estimate();
+  render();
+}
+
+async function loadInbox() {
+  state.inbox = await readAll("inbox");
 }
 
 async function downloadCrops() {
@@ -633,7 +704,7 @@ async function downloadCrops() {
   for (const item of saved) {
     const folder = FOLDER_BY_CATEGORY[item.category] || "pieces";
     const safe = item.name.replace(/[^\w.-]+/g, "-").slice(0, 40) || "piece";
-    files[`${folder}/${safe}-${item.id}.png`] = new Uint8Array(await item.imageBlob.arrayBuffer());
+    files[`${folder}/${safe}-${item.id}.${imageExtension(item.imageBlob)}`] = new Uint8Array(await item.imageBlob.arrayBuffer());
   }
   downloadBlob(await zipFiles(files), "closet-crops.zip");
 }
@@ -650,7 +721,7 @@ async function saveToFolder() {
   for (const item of saved) {
     const folderName = FOLDER_BY_CATEGORY[item.category] || "pieces";
     const folder = await root.getDirectoryHandle(folderName, { create: true });
-    const handle = await folder.getFileHandle(`piece-${item.id}.png`, { create: true });
+    const handle = await folder.getFileHandle(`piece-${item.id}.${imageExtension(item.imageBlob)}`, { create: true });
     const writable = await handle.createWritable();
     await writable.write(item.imageBlob);
     await writable.close();
@@ -666,7 +737,7 @@ async function downloadBackup() {
   };
   for (const item of state.items) {
     if (!item.imageBlob) continue;
-    files[`closet_images/item_${item.id}.png`] = new Uint8Array(await item.imageBlob.arrayBuffer());
+    files[`closet_images/item_${item.id}.${imageExtension(item.imageBlob)}`] = new Uint8Array(await item.imageBlob.arrayBuffer());
   }
   downloadBlob(await zipFiles(files), "closet-backup.zip");
 }
@@ -723,7 +794,7 @@ async function migrate(form, mode) {
   for (const file of [...images, ...zippedImages]) photos.set(file.name.toLowerCase(), file);
   for (const item of items) {
     const file = photos.get(basename(item.imagePath).toLowerCase());
-    if (file) item.imageBlob = file;
+    if (file) item.imageBlob = await shrinkStoredPhoto(file);
   }
   if (mode === "replace") {
     await clearStore("items");
@@ -789,7 +860,7 @@ document.body.addEventListener("click", async (event) => {
       runner.stopAfterPhoto();
     } else if (action === "pick-folder") {
       const result = await runner.chooseFolder();
-      if (result) flash("ok", result.added ? `Saved ${word(result.added, "photo", "photos")} on this phone.` : "Those photos were already scanned.");
+      if (result) flash("ok", result.added ? `Queued ${word(result.added, "photo", "photos")}. Originals were not copied.` : "Those photos were already scanned.");
       render();
     } else if (action === "clear-unfinished") {
       await runner.clearUnfinished();
@@ -808,6 +879,8 @@ document.body.addEventListener("click", async (event) => {
       await saveToFolder();
     } else if (action === "download-backup") {
       await downloadBackup();
+    } else if (action === "reclaim") {
+      await reclaimSpace();
     }
   } catch (error) {
     flash("err", error.message || "That could not be saved on this device.");
@@ -907,6 +980,9 @@ async function boot() {
     navigator.serviceWorker.register("./sw.js").catch(() => {});
   }
   await runner.resumeIfNeeded();
+  await loadInbox();
+  if (navigator.storage?.estimate) state.storageEstimate = await navigator.storage.estimate();
+  if (state.screen === "settings") render();
 }
 
 boot();

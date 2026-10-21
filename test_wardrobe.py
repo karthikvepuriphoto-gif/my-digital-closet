@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 from PIL import Image
 
@@ -184,6 +185,10 @@ class WardrobeTests(unittest.TestCase):
             root = Path(tmp)
             relative = w.store_photo(_png(), 4, root)
             self.assertTrue(relative.startswith("closet_images/item_4_"))
+            self.assertTrue(relative.endswith(".webp"))
+            stored = (root / relative).read_bytes()
+            self.assertTrue(stored.startswith(b"RIFF") and b"WEBP" in stored[:12])
+            self.assertLessEqual(len(stored), 40 * 1024)
             self.assertIsNotNone(w.resolve_image(relative, root))
             outside = root / "note.txt"
             outside.write_text("keep", encoding="utf-8")
@@ -216,6 +221,49 @@ class WardrobeTests(unittest.TestCase):
         self.assertEqual(outfits.iloc[0]["Name"], "Dress day")
         self.assertEqual(outfits.iloc[0]["FullBody_ID"], "3")
         self.assertTrue(w.delete_outfit(outfits, int(outfits.iloc[0]["ID"])).empty)
+
+    def test_reclaim_shrinks_closet_photos_and_leaves_outside_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "closet_images"
+            folder.mkdir()
+            picture = np.zeros((700, 500, 3), dtype=np.uint8)
+            picture[:350] = (180, 40, 40)
+            picture[350:] = (50, 90, 170)
+            Image.fromarray(picture, mode="RGB").save(folder / "item_1.png", "PNG", compress_level=0)
+            outside = root / "keep.png"
+            Image.fromarray(picture, mode="RGB").save(outside, "PNG", compress_level=0)
+            outside_bytes = outside.read_bytes()
+            items = w.add_item(
+                w.load_items(root / "wardrobe_db.csv"),
+                w.load_outfits(root / "outfits_db.csv"),
+                category="Tops",
+                sub_category="Coat",
+                color="Blue",
+                season="All",
+                image_path="closet_images/item_1.png",
+            )
+            items = w.add_item(
+                items,
+                w.load_outfits(root / "outfits_db.csv"),
+                category="Tops",
+                sub_category="Note",
+                color="White",
+                season="All",
+                image_path="keep.png",
+            )
+            updated, freed = w.reclaim_closet_photos(items, root)
+            self.assertGreater(freed, 0)
+            path = updated.iloc[0]["Image_Path"]
+            self.assertTrue(str(path).endswith(".webp"))
+            self.assertTrue((root / path).is_file())
+            self.assertFalse((folder / "item_1.png").exists())
+            self.assertLessEqual((root / path).stat().st_size, 40 * 1024)
+            self.assertEqual(updated.iloc[1]["Image_Path"], "keep.png")
+            self.assertEqual(outside.read_bytes(), outside_bytes)
+            again, freed_again = w.reclaim_closet_photos(updated, root)
+            self.assertEqual(freed_again, 0)
+            self.assertEqual(again.iloc[0]["Image_Path"], path)
 
     def test_unicode_name_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -16,8 +16,10 @@ import {
   nearestColor,
   outfitsFromCsv,
   regionsFromLabelMasks,
+  formatBytes,
   scaledCropBox,
   scrubOutfits,
+  storageReport,
   sortItems,
   validateOutfit,
 } from "./closet.js";
@@ -161,6 +163,28 @@ test("regions keep a long top as outerwear and merge both shoes", () => {
   for (let y = 0; y < 8; y += 1) {
     for (let x = 14; x < 26; x += 1) assert.equal(coat[y * width + x], 0);
   }
+});
+
+test("storage counts one photo per piece and leftover originals", () => {
+  const report = storageReport({
+    items: [{ imageBlob: { size: 20 * 1024 } }, { imageBlob: { size: 40 * 1024 } }, {}],
+    garments: [
+      { status: "pending", cropBlob: { size: 30 * 1024 } },
+      { status: "approved", cropBlob: { size: 12 * 1024 } },
+    ],
+    inbox: [{ blob: { size: 500 * 1024 } }],
+  });
+  assert.equal(report.pieceCount, 2);
+  assert.equal(report.averageBytes, 30 * 1024);
+  assert.equal(report.reviewCount, 1);
+  assert.equal(report.extraBytes, 12 * 1024);
+  assert.equal(report.originalCount, 1);
+  assert.equal(report.totalBytes, 20 * 1024 + 40 * 1024 + 30 * 1024 + 12 * 1024 + 500 * 1024);
+  assert.equal(formatBytes(20 * 1024), "20 KB");
+  assert.equal(formatBytes(1536), "1.5 KB");
+  assert.equal(formatBytes(800), "800 B");
+  const csv = itemsToCsv([{ id: 4, name: "Coat", category: "Outerwear", color: "Blue", season: "All", imageBlob: { type: "image/webp" }, extra: {} }]);
+  assert.match(csv, /closet_images\/item_4\.webp/);
 });
 
 test("file identity uses the relative path, size, and time", () => {
