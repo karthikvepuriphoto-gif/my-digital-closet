@@ -1,0 +1,514 @@
+import io
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import numpy as np
+from PIL import Image
+
+import import_models
+import photo_import as pi
+import wardrobe as w
+
+
+def _region(
+    color=(180, 40, 40),
+    category="Tops",
+    folder="tops",
+    friendly="top",
+    label="Upper-clothes",
+    confidence=0.8,
+    size=(80, 100),
+):
+    return pi.Region(
+        label,
+        category,
+        folder,
+        friendly,
+        Image.new("RGB", size, color),
+        confidence,
+    )
+
+
+class ScriptedFinder(pi.ClothesFinder):
+    def __init__(self, batches):
+        self.batches = [list(batch) for batch in batches]
+        self.calls = 0
+
+    def find(self, image):
+        self.calls += 1
+        if not self.batches:
+            return []
+        return self.batches.pop(0)
+
+
+class MeanEmbedder(pi.Embedder):
+    def embed(self, image):
+        pixels = np.asarray(image.convert("RGB").resize((8, 8)), dtype=np.float32)
+        mean = pixels.mean(axis=(0, 1))
+        norm = float(np.linalg.norm(mean)) or 1.0
+        return (mean / norm).tolist()
+
+
+class MutatingFinder(pi.ClothesFinder):
+    def __init__(self, path: Path):
+        self.path = path
+
+    def find(self, image):
+        self.path.write_bytes(self.path.read_bytes() + b"\x00")
+        return [_region()]
+
+
+def _photo(folder: Path, name: str, color=(30, 30, 30), size=(48, 64)) -> Path:
+    path = folder / name
+    Image.new("RGB", size, color).save(path, "PNG")
+    return path
+
+
+def _empty_closet(root: Path):
+    return w.load_items(root / "wardrobe_db.csv"), w.load_outfits(root / "outfits_db.csv")
+
+
+class PhotoImportTests(unittest.TestCase):
+    def test_scan_keeps_originals_and_writes_crops_outside(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            photo = _photo(source, "day.png")
+            before = photo.read_bytes()
+            signature = photo.stat().st_mtime_ns
+            finder = ScriptedFinder([[_region()]])
+            updates = list(pi.scan_folder(source, output, finder, MeanEmbedder()))
+            self.assertEqual(photo.read_bytes(), before)
+            self.assertEqual(photo.stat().st_mtime_ns, signature)
+            self.assertEqual(updates[-1].found, 1)
+            pending = list((output / "pending").glob("*.webp"))
+            self.assertEqual(len(pending), 1)
+            payload = pending[0].read_bytes()
+            self.assertTrue(payload.startswith(b"RIFF") and b"WEBP" in payload[:12])
+            self.assertLessEqual(pending[0].stat().st_size, 40 * 1024)
+            self.assertTrue(pi._is_relative_to(pending[0], output))
+            state = pi.load_state(output)
+            self.assertEqual(state["files"][str(photo.resolve())]["error"], "")
+            self.assertEqual(len(pi.pending_garments(output)), 1)
+            items, _outfits = _empty_closet(root)
+            self.assertTrue(items.empty)
+
+    def test_approve_adds_a_closet_row_and_reject_cannot_delete_originals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            photo = _photo(source, "shirt.png", color=(180, 40, 40))
+            list(pi.scan_folder(source, output, ScriptedFinder([[_region()]]), MeanEmbedder()))
+            pending = pi.pending_garments(output)[0]
+            items, outfits = _empty_closet(root)
+            items, outfits = pi.approve_garment(
+                output,
+                pending["id"],
+                items,
+                outfits,
+                name="Red top",
+                category="Tops",
+                color="Red",
+                season="Summer",
+            )
+            saved = Path(items.iloc[0]["Image_Path"])
+            self.assertEqual(saved.parent.name, "tops")
+            self.assertTrue(saved.is_file())
+            self.assertFalse((output / "pending" / saved.name).exists())
+            self.assertEqual(items.iloc[0]["Source_Photo"], str(photo.resolve()))
+            self.assertEqual(items.iloc[0]["Sub-Category"], "Red top")
+            self.assertEqual(items.iloc[0]["Primary Color"], "Red")
+            self.assertTrue(str(items.iloc[0]["Color Hex"]).startswith("#"))
+            self.assertTrue(photo.is_file())
+            items, outfits = w.delete_item(items, outfits, int(items.iloc[0]["ID"]), root)
+            self.assertTrue(saved.is_file())
+            self.assertTrue(photo.is_file())
+
+            other = _photo(source, "keep.png")
+            before_other = other.read_bytes()
+            pi.save_state(
+                output,
+                {
+                    "version": 1,
+                    "files": {},
+                    "garments": {
+                        "danger": {
+                            "id": "danger",
+                            "status": "pending",
+                            "crop_path": str(other),
+                        }
+                    },
+                },
+            )
+            pi.reject_garment(output, "danger")
+            self.assertTrue(other.is_file())
+            self.assertEqual(other.read_bytes(), before_other)
+
+    def test_reject_removes_only_the_pending_crop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            photo = _photo(source, "hat.png")
+            list(
+                pi.scan_folder(
+                    source,
+                    output,
+                    ScriptedFinder([[_region(category="Accessories", folder="accessories", friendly="hat", label="Hat")]]),
+                    MeanEmbedder(),
+                )
+            )
+            garment = pi.pending_garments(output)[0]
+            crop = Path(garment["crop_path"])
+            self.assertTrue(crop.is_file())
+            pi.reject_garment(output, garment["id"])
+            self.assertFalse(crop.exists())
+            self.assertTrue(photo.is_file())
+            self.assertEqual(pi.load_state(output)["garments"][garment["id"]]["status"], "rejected")
+            self.assertEqual(pi.pending_garments(output), [])
+
+    def test_resume_limit_and_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            photos = [_photo(source, f"{index}.png") for index in range(3)]
+            red = _region(color=(180, 40, 40))
+            blue = _region(color=(50, 90, 170))
+            finder = ScriptedFinder([[red], [red], [blue]])
+            embedder = MeanEmbedder()
+            first = list(pi.scan_folder(source, output, finder, embedder, limit=1))
+            self.assertEqual(finder.calls, 1)
+            self.assertEqual(first[-1].waiting, 2)
+            self.assertEqual(pi.import_counts(source, output)["waiting"], 2)
+            self.assertEqual(len(pi.pending_garments(output)), 1)
+            second = list(pi.scan_folder(source, output, finder, embedder))
+            self.assertEqual(finder.calls, 3)
+            self.assertEqual(second[-1].found, 1)
+            pending = pi.pending_garments(output)
+            self.assertEqual(len(pending), 2)
+            matched = [row for row in pending if len(row["sources"]) == 2][0]
+            self.assertEqual(matched["color"], "Red")
+            self.assertCountEqual(matched["sources"], [str(photos[0].resolve()), str(photos[1].resolve())])
+            crops = list(output.rglob("*.webp"))
+            self.assertEqual(len(crops), 2)
+            self.assertEqual(len({path.resolve() for path in crops}), len(pending))
+            again = list(pi.scan_folder(source, output, finder, embedder))
+            self.assertEqual(again[0].total, 0)
+            self.assertEqual(finder.calls, 3)
+
+    def test_rejected_duplicate_is_not_added_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            _photo(source, "one.png")
+            _photo(source, "two.png")
+            finder = ScriptedFinder([[_region()], [_region()]])
+            list(pi.scan_folder(source, output, finder, MeanEmbedder(), limit=1))
+            garment = pi.pending_garments(output)[0]
+            pi.reject_garment(output, garment["id"])
+            list(pi.scan_folder(source, output, finder, MeanEmbedder()))
+            self.assertEqual(pi.pending_garments(output), [])
+            stored = pi.load_state(output)["garments"][garment["id"]]
+            self.assertEqual(stored["status"], "rejected")
+            self.assertEqual(len(stored["sources"]), 2)
+
+    def test_approved_duplicate_updates_the_closet_link(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            first = _photo(source, "first.png")
+            second = _photo(source, "second.png")
+            coat = _region(category="Outerwear", folder="outerwear", friendly="coat", label="Coat")
+            finder = ScriptedFinder([[_region()], [coat]])
+            list(pi.scan_folder(source, output, finder, MeanEmbedder(), limit=1))
+            garment = pi.pending_garments(output)[0]
+            items, outfits = _empty_closet(root)
+            items, outfits = pi.approve_garment(
+                output,
+                garment["id"],
+                items,
+                outfits,
+                name="Red top",
+                category="Tops",
+                color="Red",
+                season="All",
+            )
+            list(pi.scan_folder(source, output, finder, MeanEmbedder()))
+            linked = pi.refresh_source_links(items, output)
+            self.assertEqual(linked.iloc[0]["Source_Photo"], str(first.resolve()))
+            self.assertIn(str(second.resolve()), linked.iloc[0]["Source_Photos"])
+            self.assertEqual(len(pi.pending_garments(output)), 0)
+
+    def test_unreadable_photo_does_not_stop_the_folder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            bad = source / "notes.jpg"
+            bad.write_bytes(b"this is not a photo")
+            good = _photo(source, "good.png")
+            (source / ".hidden.png").write_bytes(b"skip")
+            finder = ScriptedFinder([[_region()]])
+            updates = list(pi.scan_folder(source, output, finder, MeanEmbedder()))
+            self.assertEqual(finder.calls, 1)
+            self.assertEqual(len(updates), 2)
+            state = pi.load_state(output)
+            self.assertNotEqual(state["files"][str(bad.resolve())]["error"], "")
+            self.assertEqual(state["files"][str(good.resolve())]["error"], "")
+            self.assertEqual(len(pi.pending_garments(output)), 1)
+
+    def test_crops_folder_cannot_sit_inside_the_photos(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "pictures"
+            source.mkdir()
+            photo = _photo(source, "day.png")
+            before = photo.read_bytes()
+            with self.assertRaises(pi.PhotoImportError):
+                list(pi.scan_folder(source, source / "crops", ScriptedFinder([[_region()]]), MeanEmbedder()))
+            with self.assertRaises(pi.PhotoImportError):
+                list(pi.scan_folder(source, source, ScriptedFinder([[]]), MeanEmbedder()))
+            self.assertEqual(photo.read_bytes(), before)
+            self.assertFalse((source / "crops").exists())
+
+    def test_changed_photo_stops_the_scan_before_a_crop_is_saved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            photo = _photo(source, "live.png")
+            with self.assertRaises(pi.PhotoImportError):
+                list(pi.scan_folder(source, output, MutatingFinder(photo), MeanEmbedder()))
+            self.assertEqual(list((output / "pending").glob("*.webp")), [])
+            self.assertEqual(list((output / "pending").glob("*.png")), [])
+            self.assertEqual(pi.load_state(output)["files"], {})
+
+    def test_color_components_outerwear_and_shoes(self):
+        self.assertEqual(pi.nearest_color(Image.new("RGB", (12, 12), (50, 90, 170))), "Blue")
+        name, hex_color = pi.dominant_color(Image.new("RGB", (32, 32), (50, 90, 170)))
+        self.assertEqual(name, "Blue")
+        self.assertRegex(hex_color, r"^#[0-9A-F]{6}$")
+        measured = tuple(int(hex_color[index : index + 2], 16) for index in (1, 3, 5))
+        self.assertLess(max(abs(left - right) for left, right in zip(measured, (50, 90, 170))), 3)
+        mask = np.zeros((30, 40), dtype=bool)
+        mask[2:10, 2:10] = True
+        mask[16:28, 20:36] = True
+        self.assertEqual(len(pi.component_boxes(mask, min_pixels=10)), 2)
+
+        person = (0, 0, 200, 80)
+        coat = pi.classify_label("Upper-clothes", (20, 10, 160, 70), person)
+        self.assertEqual(coat[0], "Outerwear")
+        shirt = pi.classify_label("Upper-clothes", (30, 10, 80, 70), person)
+        self.assertEqual(shirt[0], "Tops")
+        whole = pi.classify_label("Upper-clothes", person, person)
+        self.assertEqual(whole[0], "Tops")
+
+        image = Image.new("RGB", (80, 200), (240, 240, 240))
+        labels = np.zeros((200, 80), dtype=np.int32)
+        labels[0:30, 20:50] = 11
+        labels[30:170, 10:70] = 4
+        labels[170:200, 15:65] = 12
+        regions = pi.regions_from_mask(labels, image, {4: "Upper-clothes", 11: "Face", 12: "Left-leg"})
+        self.assertEqual([region.category for region in regions], ["Outerwear"])
+
+        shoes = np.zeros((200, 200), dtype=np.int32)
+        shoes[140:190, 20:70] = 9
+        shoes[140:190, 100:150] = 10
+        shoe_image = Image.new("RGB", (200, 200), (20, 20, 20))
+        found = pi.regions_from_mask(shoes, shoe_image, {9: "Left-shoe", 10: "Right-shoe"})
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].friendly, "shoes")
+        self.assertEqual(found[0].category, "Footwear")
+
+    def test_color_uses_the_garment_and_crops_stay_modest(self):
+        image = Image.new("RGB", (90, 90), (245, 245, 245))
+        pixels = image.load()
+        for y in range(15, 75):
+            for x in range(15, 75):
+                if y < 20 or y >= 70 or x < 20 or x >= 70:
+                    pixels[x, y] = (180, 40, 40)
+        labels = np.zeros((90, 90), dtype=np.int32)
+        labels[15:75, 15:75] = 4
+        labels[20:70, 20:70] = 0
+        labels[0:18, 30:60] = 11
+        for y in range(0, 18):
+            for x in range(30, 60):
+                pixels[x, y] = (40, 110, 60)
+        regions = pi.regions_from_mask(labels, image, {4: "Upper-clothes", 11: "Face"})
+        self.assertEqual(len(regions), 1)
+        self.assertEqual(regions[0].color, "Red")
+        self.assertTrue(regions[0].color_hex.startswith("#"))
+        crop = regions[0].crop
+        self.assertEqual(crop.mode, "RGBA")
+        self.assertLessEqual(max(crop.size), pi.CROP_EDGE)
+        alpha = np.asarray(crop.getchannel("A"))
+        self.assertEqual(int(alpha[alpha.shape[0] // 2, alpha.shape[1] // 2]), 0)
+        opaque = alpha > 200
+        self.assertTrue(np.any(opaque))
+        reds = np.asarray(crop.convert("RGB"))[opaque]
+        self.assertGreater(float(reds[:, 0].mean()), 150)
+        self.assertLess(float(reds[:, 1].mean()), 80)
+        encoded = pi.encode_webp(crop)
+        self.assertTrue(encoded.startswith(b"RIFF") and b"WEBP" in encoded[:12])
+        self.assertLessEqual(len(encoded), 40 * 1024)
+
+        wide_array = np.full((1200, 1800, 3), 245, dtype=np.uint8)
+        wide_array[100:1100, 100:1700] = (180, 40, 40)
+        wide = Image.fromarray(wide_array, mode="RGB")
+        wide_labels = np.zeros((1200, 1800), dtype=np.int32)
+        wide_labels[100:1100, 100:1700] = 4
+        large = pi.regions_from_mask(wide_labels, wide, {4: "Upper-clothes"})
+        self.assertEqual(large[0].color, "Red")
+        self.assertLessEqual(max(large[0].crop.size), pi.HIGH_EDGE)
+        self.assertGreater(max(large[0].crop.size), pi.CROP_EDGE)
+        self.assertIsNotNone(large[0].crop_box)
+        self.assertEqual(pi.downscale(wide).size, (640, 427))
+
+        turned = Image.new("RGB", (40, 16), (180, 40, 40))
+        exif = turned.getexif()
+        exif[274] = 6
+        buffer = io.BytesIO()
+        turned.save(buffer, "JPEG", exif=exif, quality=95)
+        prepared = pi.prepare_photo(Image.open(io.BytesIO(buffer.getvalue())))
+        self.assertEqual(prepared.size, (16, 40))
+        self.assertEqual(prepared.mode, "RGB")
+
+        from PIL import ImageCms
+
+        source = ImageCms.createProfile("sRGB")
+        lab = ImageCms.createProfile("LAB")
+        forward = ImageCms.buildTransform(source, lab, "RGB", "LAB")
+        tagged = ImageCms.applyTransform(Image.new("RGB", (8, 8), (180, 40, 40)), forward)
+        tagged.info["icc_profile"] = ImageCms.ImageCmsProfile(lab).tobytes()
+        restored = pi.prepare_photo(tagged)
+        self.assertEqual(restored.mode, "RGB")
+        center = restored.getpixel((4, 4))
+        self.assertLess(max(abs(left - right) for left, right in zip(center, (180, 40, 40))), 8)
+
+    def test_reclaim_keeps_one_webp_and_drops_extra_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            _photo(source, "day.png")
+            list(pi.scan_folder(source, output, ScriptedFinder([[_region()]]), MeanEmbedder()))
+            orphan = output / "pending" / "extra.png"
+            Image.new("RGB", (64, 64), (10, 10, 10)).save(orphan, "PNG")
+            outside = root / "original.png"
+            Image.new("RGB", (32, 32), (1, 2, 3)).save(outside, "PNG")
+            before = pi.storage_summary(output)
+            self.assertEqual(before["crop_count"], 1)
+            self.assertLessEqual(before["crop_average"], 40 * 1024)
+            result = pi.reclaim_output(output)
+            self.assertFalse(orphan.exists())
+            self.assertTrue(outside.is_file())
+            self.assertGreaterEqual(result["freed"], 0)
+            self.assertEqual(result["crop_count"], 1)
+            kept = list(output.rglob("*.webp"))
+            self.assertEqual(len(kept), 1)
+            self.assertLessEqual(kept[0].stat().st_size, 40 * 1024)
+            again = pi.reclaim_output(output)
+            self.assertEqual(again["crop_count"], 1)
+            self.assertEqual(len(list(output.rglob("*.webp"))), 1)
+
+    def test_presets_never_enlarge_and_high_keeps_more_detail(self):
+        small_source = Image.new("RGBA", (300, 180), (180, 40, 40, 255))
+        for spec in pi.PRESET_LIST:
+            with Image.open(io.BytesIO(pi.encode_webp(small_source, spec))) as image:
+                self.assertLessEqual(max(image.size), 300)
+        wide = Image.new("RGB", (1800, 1200), (50, 90, 170))
+        with Image.open(io.BytesIO(pi.encode_webp(wide, "small"))) as image:
+            self.assertLessEqual(max(image.size), pi.PRESETS["small"]["edge"])
+        with Image.open(io.BytesIO(pi.encode_webp(wide, "high"))) as image:
+            self.assertEqual(max(image.size), pi.PRESETS["high"]["edge"])
+        self.assertEqual(pi.resolve_preset(None)["id"], "small")
+        self.assertEqual(pi.projection_line(30 * 1024, 1000), "~1,000 items ≈ 29.3 MB")
+        self.assertEqual(
+            pi.storage_lines(16 * 1024, own=False),
+            ["Estimate · 16 KB each", "~100 items ≈ 1.6 MB", "~1,000 items ≈ 15.6 MB"],
+        )
+        self.assertEqual(pi.storage_lines(15 * 1024, own=True)[0], "Your average · 15 KB each")
+        self.assertEqual(pi.space_comparison(16 * 1024, 119 * 1024), "Small uses about 7.4× less space than High.")
+        self.assertIn("browsing and matching", pi.PRESETS["small"]["detail"])
+
+    def test_sample_outfit_storage_comes_from_the_encoder(self):
+        pieces = pi.sample_outfit()
+        self.assertGreaterEqual(len(pieces), 3)
+        rows = pi.preview_rows([image for _, image in pieces])
+        averages = {row["id"]: row["average"] for row in rows}
+        self.assertGreater(averages["medium"], averages["small"])
+        self.assertGreater(averages["high"], averages["medium"])
+        comparison = pi.space_comparison(averages["small"], averages["high"])
+        self.assertTrue(comparison.startswith("Small uses about "))
+        self.assertIn("less space than High.", comparison)
+        lines = pi.storage_lines(averages["small"], own=False)
+        self.assertIn("100 items", lines[1])
+        self.assertIn("1,000 items", lines[2])
+
+    def test_changing_size_uses_the_source_and_does_not_invent_detail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pictures"
+            output = root / "crops"
+            source.mkdir()
+            photo = _photo(source, "coat.png", color=(180, 40, 40), size=(900, 1200))
+            list(pi.scan_folder(source, output, ScriptedFinder([[_region(size=(900, 1200))]]), MeanEmbedder(), preset="small"))
+            garment = pi.pending_garments(output)[0]
+            saved_color = garment["color"]
+            saved_hex = garment["color_hex"]
+            # The scripted crop has no box, so a larger preset cannot invent detail.
+            grown = pi.apply_quality(output, "high", root)
+            self.assertEqual(grown["rebuilt"], 0)
+            self.assertEqual(grown["kept"], 1)
+            again = pi.load_state(output)["garments"][garment["id"]]
+            self.assertEqual(again["color"], saved_color)
+            self.assertEqual(again["color_hex"], saved_hex)
+            with Image.open(again["crop_path"]) as image:
+                self.assertLessEqual(max(image.size), 900)
+
+            listed = pi.load_state(output)
+            listed["garments"][garment["id"]]["crop_box"] = [0.1, 0.1, 0.8, 0.9]
+            pi.save_state(output, listed)
+            rebuilt = pi.apply_quality(output, "medium", root)
+            self.assertEqual(rebuilt["rebuilt"], 1)
+            kept = pi.load_state(output)["garments"][garment["id"]]
+            self.assertEqual(kept["color"], saved_color)
+            self.assertEqual(kept["color_hex"], saved_hex)
+            with Image.open(kept["crop_path"]) as image:
+                self.assertLessEqual(max(image.size), pi.PRESETS["medium"]["edge"])
+                self.assertGreater(max(image.size), 300)
+                pixel = image.convert("RGB").getpixel((image.size[0] // 2, image.size[1] // 2))
+                self.assertGreater(pixel[0], pixel[2])
+
+    def test_models_are_not_loaded_until_they_exist_locally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                mock.patch.object(import_models, "MARKER", root / "ready.json"),
+                mock.patch.object(import_models, "SEGFORMER_DIR", root / "seg"),
+                mock.patch.object(import_models, "EMBEDDER_PATH", root / "embed.pth"),
+            ):
+                self.assertFalse(import_models.models_ready())
+                with self.assertRaises(pi.PhotoImportError):
+                    import_models.load_engines()
+        ready, _message = import_models.packages_ready()
+        self.assertIsInstance(ready, bool)
+
+
+if __name__ == "__main__":
+    unittest.main()

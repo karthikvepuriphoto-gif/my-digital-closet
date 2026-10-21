@@ -1,0 +1,21 @@
+[client]
+toolbarMode = "minimal"
+
+[server]
+maxUploadSize = 8
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#24382d"
+backgroundColor = "#efe8df"
+secondaryBackgroundColor = "#fffcf8"
+textColor = "#221c18"
+baseRadius = "0.8rem"
+buttonRadius = "full"
+chartCategoricalColors = ["#24382d", "#9c7b4a", "#6e8f7a", "#c46b5a", "#d7c3a3", "#355c7d"]
+
+[theme.sidebar]
+backgroundColor = "#fffcf8"

@@ -1,0 +1,17 @@
+{
+  "appId": "gif.photo.mydigitalcloset",
+  "appName": "My Digital Closet",
+  "webDir": "web",
+  "backgroundColor": "#efe8df",
+  "android": {
+    "backgroundColor": "#efe8df"
+  },
+  "server": {
+    "androidScheme": "https"
+  },
+  "cordova": {
+    "preferences": {
+      "KeepRunning": "true"
+    }
+  }
+}

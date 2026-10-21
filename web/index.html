@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#24382d">
+  <meta name="description" content="A private wardrobe that stays on your phone. Photos are never uploaded.">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Closet">
+  <title>My Digital Closet</title>
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icons/icon-192.png" sizes="192x192">
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <p class="eyebrow">Closet tracker</p>
+      <div class="top-row">
+        <h1 class="wordmark">My Digital Closet</h1>
+        <a id="settings-link" class="link" href="#settings">Settings</a>
+      </div>
+      <p id="counts" class="counts"></p>
+    </header>
+    <main id="screen"></main>
+  </div>
+  <nav class="tabbar" aria-label="Sections">
+    <a href="#closet">Closet</a>
+    <a href="#add">Add</a>
+    <a href="#outfits">Looks</a>
+    <a href="#insights">Stats</a>
+    <a href="#import">Import</a>
+  </nav>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

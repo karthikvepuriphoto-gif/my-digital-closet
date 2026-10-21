@@ -1,0 +1,10 @@
+streamlit>=1.66
+numpy>=2,<3
+pandas>=2.2
+Pillow>=10
+altair>=5
+transformers>=4.44
+huggingface_hub>=0.24
+
+# PyTorch is installed separately so a laptop gets the CPU build
+# instead of a multi-gigabyte CUDA wheel. See the README.

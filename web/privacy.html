@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#24382d">
+  <title>Privacy · My Digital Closet</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <article class="app page">
+    <p class="eyebrow">Privacy</p>
+    <h1>Your closet stays on this phone</h1>
+    <p>My Digital Closet does not have an account, a closet server, or an ad network. Pieces, outfits, and photos are saved in this browser, on this device, using the browser’s private storage (IndexedDB). Clearing the site data, or deleting the home-screen app, removes that closet from the device.</p>
+    <h2>Photos</h2>
+    <p>You pick pictures with the phone’s file picker, a folder picker, or the camera. The app reads those files to find clothes. It does not upload them, does not send them to a vision service, and does not change the originals. It does not keep a copy of the original photo. The queue stores the path, size, and time so a scan can continue, and you may need to choose the same files again if the page was closed. Before a photo is scanned it is turned upright, converted to ordinary sRGB color, and shrunk. The color name and hex come from the garment pixels and are saved before the picture is compressed. The first time you open the app you choose how large saved pictures are. Each piece keeps one WebP cutout at that size. You can change the size later in Settings. A larger size can be rebuilt from the original photo only while that photo can still be opened. Otherwise the app can only make the saved picture smaller. Settings shows how much space those pictures use, and Clean up removes leftover copies. A zip you download, or a folder you pick with the file-system prompt, is written only because you asked for it.</p>
+    <h2>The clothing model</h2>
+    <p>The first time you scan, the app downloads two open models into this browser’s cache: a small clothing segmenter (SegFormer B0 clothes, about 4 MB) and a small comparison model (DINOv2 small, about 15 MB). That download is a normal file download from the model host. Your photos are not part of the request. Later scans use the cached copies and run on the phone, even if you are offline. The app does not turn on usage telemetry for those tools.</p>
+    <p>Opening the closet, adding a piece, or building an outfit does not download the models and does not contact that host.</p>
+    <h2>What we don’t collect</h2>
+    <p>There is no analytics, no account, and no list of your clothes anywhere except on your device. The person who published this copy of the app cannot see your wardrobe.</p>
+    <h2>The Play listing</h2>
+    <p>If you installed this from Google Play, the Android app is these same pages packaged on the phone, plus a notification while a scan is running. The notification is there so Android lets the scan finish when the app is not on screen. It does not send the photos anywhere. You can choose to scan only while the phone is charging. The screen-on switch only keeps this phone’s screen awake during a scan. Play’s own account is Google’s, not this app’s. The privacy policy for the listing is this page.</p>
+    <p><a class="link" href="./">Back to the closet</a></p>
+  </article>
+</body>
+</html>
