@@ -1,0 +1,8 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+.streamlit/secrets.toml
+wardrobe_db.csv
+outfits_db.csv
+closet_images/
+*.tmp
