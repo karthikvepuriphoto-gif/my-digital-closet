@@ -1,4 +1,4 @@
-const CACHE = "closet-shell-v7";
+const CACHE = "closet-shell-v8";
 const SHELL = [
   "./",
   "./index.html",

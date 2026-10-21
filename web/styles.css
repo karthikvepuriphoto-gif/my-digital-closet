@@ -207,6 +207,8 @@ input, select {
   border-radius: 12px;
 }
 .tabbar a[aria-current="page"] { background: #24382d; color: #f6f1ea; }
+body.setup .tabbar, body.setup #settings-link { display: none; }
+body.setup .app { padding-bottom: calc(1.2rem + env(safe-area-inset-bottom)); }
 
 .progress {
   height: 10px;

@@ -335,8 +335,7 @@ function renderImport() {
   return `
     ${banner()}
     <h2>Import from photos</h2>
-    ${state.qualityChosen ? "" : qualityChooserHtml()}
-    <p class="lede">Pick pictures already on this phone. Finished pieces are kept. The original photos are not copied onto the phone.</p>
+    <p class="lede">Pick pictures already on this phone. Finished pieces are kept. The original photos are not copied onto the phone. New pictures use the size you chose in setup.</p>
     <div class="banner ok">Your pictures stay where they are. The scan only reads them. It does not upload them and it does not keep a copy. The color is saved before the small picture is compressed. <a class="link" href="./privacy.html">Privacy</a> · <a class="link" href="#settings">Storage</a></div>
     <div class="stack">
       <label class="file button">Choose photos<input id="pick-photos" type="file" accept="image/*" multiple></label>
@@ -404,34 +403,49 @@ function lookPieces(outfit) {
     .filter(Boolean);
 }
 
-function qualityChooserHtml() {
+function renderSetup() {
+  return `
+    ${banner()}
+    <p class="eyebrow">Setup</p>
+    <h2>Choose a picture size</h2>
+    <p class="lede">This is the first step. The size you pick is saved and used for every photo you import. You can change it later in Settings.</p>
+    ${qualityChooserHtml("setup")}`;
+}
+
+function qualityChooserHtml(mode) {
+  const setup = mode === "setup";
   const preview = state.qualityPreview;
   const columns = preview?.columns || QUALITY_PRESETS.map((preset) => ({ preset, files: [], average: 0 }));
   const owned = state.items.filter((item) => item.imageBlob).length;
   const cards = columns.map((column) => {
     const preset = column.preset;
+    const selected = state.qualityChosen && state.cropQuality === preset.id;
     const photos = column.files.map((file) => `
       <img src="${blobUrl(`preview-${preset.id}-${file.name}`, file.blob)}" alt="">
       <span>${escapeHtml(file.name)} · ${formatBytes(file.bytes)}</span>`).join("");
     const average = column.average || 0;
     return `
-      <button type="button" class="preset" data-action="quality" data-id="${preset.id}" aria-pressed="${state.cropQuality === preset.id}">
+      <button type="button" class="preset" data-action="quality" data-id="${preset.id}" aria-pressed="${selected}">
         <b>${escapeHtml(preset.label)}</b>
         <span>${preset.edge} px · ${escapeHtml(preset.aim)}</span>
         <div class="preset-photos">${photos || `<span>${preview?.loading ? "Preparing…" : ""}</span>`}</div>
         ${average ? `<span>${formatBytes(average)} each</span>` : ""}
-        ${average && owned ? `<span>Your ${owned} ${owned === 1 ? "piece" : "pieces"} ≈ ${formatBytes(average * owned)}</span>` : ""}
+        ${average && owned && !setup && preview?.own ? `<span>Your ${owned} ${owned === 1 ? "piece" : "pieces"} ≈ ${formatBytes(average * owned)}</span>` : ""}
         ${average ? `<span>${projectionLine(average, 1000)}</span>` : ""}
+        <span>${selected ? "New pictures use this size." : "Use this size"}</span>
       </button>`;
   }).join("");
-  const limited = preview?.limited
+  const limited = !setup && preview?.limited
     ? `<p class="hint">The original photo isn't available, so a larger size can't get sharper than the picture already saved.</p>`
     : "";
+  const lede = setup
+    ? "The sample outfit below is not saved in your closet. Each column is that outfit at one size, with the real file size and an estimate for about 1,000 pieces."
+    : "The color is saved before the picture is compressed, so it stays the same at every size.";
   return `
     <section class="chooser" aria-label="Picture size">
-      <h2>Picture size</h2>
-      <p class="lede">Small is the default. The color is saved before the picture is compressed, so it stays the same at every size.</p>
-      <p class="meta">${escapeHtml(preview?.label || "Comparing picture sizes.")}</p>
+      ${setup ? "" : "<h2>Picture size</h2>"}
+      <p class="lede">${lede}</p>
+      <p class="meta">${escapeHtml(preview?.label || (setup ? "Sample outfit." : "Comparing picture sizes."))}</p>
       ${limited}
       <div class="presets">${cards}</div>
     </section>`;
@@ -444,7 +458,7 @@ function renderSettings() {
   return `
     ${banner()}
     <h2>Settings</h2>
-    ${qualityChooserHtml()}
+    ${qualityChooserHtml("settings")}
     <p class="lede">Photos you pick are not copied. Each piece keeps one picture at the size above, and its color is saved separately.</p>
     <div class="metrics">
       <div class="metric"><b>${formatBytes(report.totalBytes)}</b>Closet files</div>
@@ -470,32 +484,34 @@ const views = {
 };
 
 function previewSignature() {
+  if (!state.qualityChosen) return "setup";
   const pending = state.garments.find((garment) => garment.status === "pending" && garment.cropBlob);
   const outfit = [...state.outfits].reverse().find((row) => lookPieces(row).some((item) => item.imageBlob));
   const item = [...state.items].reverse().find((row) => row.imageBlob);
-  return [pending?.id || "", pending?.cropBlob?.size || 0, outfit?.id || "", item?.id || "", item?.imageBlob?.size || 0].join("|");
+  return ["closet", pending?.id || "", pending?.cropBlob?.size || 0, outfit?.id || "", item?.id || "", item?.imageBlob?.size || 0].join("|");
 }
 
 function scheduleQualityPreview() {
-  const needed = state.screen === "settings" || (state.screen === "import" && !state.qualityChosen);
+  const needed = !state.qualityChosen || state.screen === "settings";
   if (!needed) return;
   const signature = previewSignature();
   if (state.qualityPreview?.signature === signature) return;
-  state.qualityPreview = { signature, loading: true, columns: [], label: "Comparing picture sizes.", limited: false };
+  state.qualityPreview = { signature, loading: true, columns: [], label: state.qualityChosen ? "Comparing picture sizes." : "Sample outfit.", limited: false, own: false };
   buildQualityPreview(signature);
 }
 
+function sampleSubject() {
+  return {
+    label: "Sample outfit, before you have clothes of your own.",
+    limited: false,
+    own: false,
+    pieces: SAMPLE_OUTFIT.map(([url, name]) => ({ name, url })),
+  };
+}
+
 async function previewSubject() {
-  const pending = state.garments.find((garment) => garment.status === "pending" && garment.cropBlob);
-  if (pending) {
-    const file = pending.sourceKey ? await runner.openSource(pending.sourceKey, pending.relativePath) : null;
-    return {
-      label: `This is ${pending.name || "a detected piece"}, from your scan.`,
-      limited: !file,
-      pieces: [{ name: pending.name || "Piece", blob: pending.cropBlob, file, cropBox: pending.cropBox }],
-    };
-  }
-  const outfit = [...state.outfits].reverse().find((row) => lookPieces(row).some((item) => item.imageBlob));
+  if (!state.qualityChosen) return sampleSubject();
+  const outfit = [...state.outfits].reverse().find((row) => lookPieces(row).filter((item) => item.imageBlob).length >= 2);
   if (outfit) {
     const pieces = [];
     for (const item of lookPieces(outfit)) {
@@ -507,6 +523,7 @@ async function previewSubject() {
       return {
         label: `This is your look, ${outfit.name}.`,
         limited: pieces.some((piece) => !piece.file),
+        own: true,
         pieces,
       };
     }
@@ -517,14 +534,21 @@ async function previewSubject() {
     return {
       label: `This is your ${item.name}.`,
       limited: !file,
+      own: true,
       pieces: [{ name: item.name, blob: item.imageBlob, file, cropBox: item.cropBox }],
     };
   }
-  return {
-    label: "Sample outfit, until you have clothes of your own.",
-    limited: false,
-    pieces: SAMPLE_OUTFIT.map(([url, name]) => ({ name, url })),
-  };
+  const pending = state.garments.find((garment) => garment.status === "pending" && garment.cropBlob);
+  if (pending) {
+    const file = pending.sourceKey ? await runner.openSource(pending.sourceKey, pending.relativePath) : null;
+    return {
+      label: `This is ${pending.name || "a detected piece"}, from your scan.`,
+      limited: !file,
+      own: true,
+      pieces: [{ name: pending.name || "Piece", blob: pending.cropBlob, file, cropBox: pending.cropBox }],
+    };
+  }
+  return sampleSubject();
 }
 
 async function encodePreviewPiece(piece, preset) {
@@ -551,12 +575,12 @@ async function buildQualityPreview(signature) {
       columns.push({ preset, files, average });
     }
     if (state.qualityPreview?.signature !== signature) return;
-    state.qualityPreview = { signature, loading: false, columns, label: subject.label, limited: subject.limited };
+    state.qualityPreview = { signature, loading: false, columns, label: subject.label, limited: subject.limited, own: subject.own };
   } catch (error) {
     if (state.qualityPreview?.signature !== signature) return;
-    state.qualityPreview = { signature, loading: false, columns: [], label: error.message || "The size comparison could not be prepared.", limited: false };
+    state.qualityPreview = { signature, loading: false, columns: [], label: error.message || "The size comparison could not be prepared.", limited: false, own: false };
   }
-  if (state.screen === "settings" || state.screen === "import") render();
+  if (!state.qualityChosen || state.screen === "settings") render();
 }
 
 async function transcodeRecord(record, blob) {
@@ -571,6 +595,7 @@ async function transcodeRecord(record, blob) {
 
 async function applyQuality(id) {
   const preset = presetById(id);
+  const first = !state.qualityChosen;
   state.cropQuality = preset.id;
   state.qualityChosen = true;
   await runner.saveSettings();
@@ -600,6 +625,14 @@ async function applyQuality(id) {
     }
   }
   state.qualityPreview = null;
+  if (first) {
+    const changed = rebuilt || shrunk
+      ? ` ${rebuilt} rebuilt from the original photo, ${shrunk} made smaller, ${kept} left as they were.`
+      : "";
+    flash("ok", `${preset.label} is the picture size for every photo you import. You can change it in Settings.${changed}`);
+    openCloset();
+    return;
+  }
   flash("ok", `${preset.label} is the picture size. ${rebuilt} rebuilt from the original photo, ${shrunk} made smaller, ${kept} left as they were.`);
   render();
 }
@@ -608,9 +641,12 @@ function render() {
   const active = document.activeElement;
   const activeId = active?.id;
   const caret = active && "selectionStart" in active ? active.selectionStart : null;
+  document.body.classList.toggle("setup", !state.qualityChosen);
   const tally = `${word(state.items.length, "piece", "pieces")} · ${word(state.outfits.length, "look", "looks")}`;
   document.querySelector("#counts").textContent = state.progress ? state.progress : tally;
-  document.querySelector("#screen").innerHTML = (views[state.screen] || renderCloset)();
+  document.querySelector("#screen").innerHTML = state.qualityChosen
+    ? (views[state.screen] || renderCloset)()
+    : renderSetup();
   scheduleQualityPreview();
   for (const link of document.querySelectorAll(".tabbar a, #settings-link")) {
     const on = link.getAttribute("href") === `#${state.screen}`;
@@ -1050,9 +1086,9 @@ document.body.addEventListener("click", async (event) => {
       await applyQuality(button.dataset.id);
     } else if (action === "scan") {
       if (!state.qualityChosen) {
-        state.cropQuality = presetById(state.cropQuality).id;
-        state.qualityChosen = true;
-        await runner.saveSettings();
+        flash("err", "Choose a picture size first. That size is used for every photo you import.");
+        render();
+        return;
       }
       await runner.start(button.dataset.limit ? Number(button.dataset.limit) : null);
     } else if (action === "stop-scan") {

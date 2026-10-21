@@ -235,6 +235,12 @@ def main() -> None:
         st.error(str(exc))
         st.stop()
 
+    if not pi.quality_chosen():
+        render_header(items, outfits, "Setup")
+        render_flash()
+        _render_setup(items, outfits)
+        return
+
     page = render_nav()
     render_header(items, outfits, page)
     render_flash()
@@ -282,7 +288,7 @@ def render_header(items: pd.DataFrame, outfits: pd.DataFrame, page: str) -> None
             unsafe_allow_html=True,
         )
     with action:
-        if page != "Add" and st.button(
+        if page not in {"Add", "Setup"} and st.button(
             "Add a piece",
             type="primary",
             width="stretch",
@@ -1003,13 +1009,8 @@ def page_import(items: pd.DataFrame, outfits: pd.DataFrame) -> None:
 
     page_title(
         "Import from photos",
-        "Point at a folder of pictures. Photos are shrunk before the scan. Suggestions stay here until you approve them.",
+        "Point at a folder of pictures. Photos are shrunk before the scan. Suggestions stay here until you approve them. New pictures use the size you chose in setup.",
     )
-    if "import_output" not in st.session_state:
-        st.session_state["import_output"] = str(pi.DEFAULT_OUTPUT)
-    early_output = Path(str(st.session_state.get("import_output") or pi.DEFAULT_OUTPUT)).expanduser()
-    if not pi.quality_chosen():
-        _render_quality_chooser(items, outfits, early_output)
     st.markdown(
         f'<div class="banner ok">{html.escape(pi.privacy_summary())}</div>',
         unsafe_allow_html=True,
@@ -1352,6 +1353,30 @@ def _open_saved_photo(items: pd.DataFrame, item_id: object):
 
 
 def _chooser_subject(items: pd.DataFrame, outfits: pd.DataFrame, output: Path) -> dict:
+    pieces: list[tuple[str, Image.Image]] = []
+    if not outfits.empty and not items.empty:
+        outfit = outfits.iloc[-1]
+        for column in ("Top_ID", "Bottom_ID", "FullBody_ID", "Outerwear_ID", "Footwear_ID"):
+            opened = _open_saved_photo(items, outfit.get(column, ""))
+            if opened:
+                pieces.append(opened)
+        if len(pieces) >= 2:
+            return {
+                "label": f"This is your look, {outfit.get('Name') or 'Untitled'}.",
+                "pieces": pieces,
+                "limited": all(max(image.size) < pi.HIGH_EDGE for _, image in pieces),
+                "own": True,
+            }
+    if not items.empty:
+        for _, row in items.iloc[::-1].iterrows():
+            opened = _open_saved_photo(items, row["ID"])
+            if opened:
+                return {
+                    "label": f"This is your {opened[0]}.",
+                    "pieces": [opened],
+                    "limited": max(opened[1].size) < pi.HIGH_EDGE,
+                    "own": True,
+                }
     if output.exists():
         try:
             pending = pi.pending_garments(output)
@@ -1365,56 +1390,57 @@ def _chooser_subject(items: pd.DataFrame, outfits: pd.DataFrame, output: Path) -
                     "label": f"This is {name}, from your scan.",
                     "pieces": [(name, image)],
                     "limited": max(image.size) < pi.HIGH_EDGE,
-                }
-    pieces: list[tuple[str, Image.Image]] = []
-    if not outfits.empty and not items.empty:
-        outfit = outfits.iloc[-1]
-        for column in ("Top_ID", "Bottom_ID", "FullBody_ID", "Outerwear_ID", "Footwear_ID"):
-            opened = _open_saved_photo(items, outfit.get(column, ""))
-            if opened:
-                pieces.append(opened)
-        if len(pieces) >= 2:
-            return {
-                "label": f"This is your look, {outfit.get('Name') or 'Untitled'}.",
-                "pieces": pieces,
-                "limited": all(max(image.size) < pi.HIGH_EDGE for _, image in pieces),
-            }
-    if not items.empty:
-        for _, row in items.iloc[::-1].iterrows():
-            opened = _open_saved_photo(items, row["ID"])
-            if opened:
-                return {
-                    "label": f"This is your {opened[0]}.",
-                    "pieces": [opened],
-                    "limited": max(opened[1].size) < pi.HIGH_EDGE,
+                    "own": True,
                 }
     return {
         "label": "Sample outfit, until you have clothes of your own.",
         "pieces": pi.sample_outfit(),
         "limited": False,
+        "own": False,
     }
 
 
-def _render_quality_chooser(items: pd.DataFrame, outfits: pd.DataFrame, output: Path) -> None:
-    subject = _chooser_subject(items, outfits, output)
+def _render_setup(items: pd.DataFrame, outfits: pd.DataFrame) -> None:
+    page_title(
+        "Choose a picture size",
+        "This is the first step. The size you pick is saved and used for every photo you import. You can change it later in Storage.",
+    )
+    output = Path(str(st.session_state.get("import_output") or pi.DEFAULT_OUTPUT)).expanduser()
+    _render_quality_chooser(items, outfits, output, mode="setup")
+
+
+def _render_quality_chooser(items: pd.DataFrame, outfits: pd.DataFrame, output: Path, mode: str = "settings") -> None:
+    if mode == "setup":
+        subject = {
+            "label": "This is a sample outfit, so you can compare sizes before you add clothes.",
+            "pieces": pi.sample_outfit(),
+            "limited": False,
+            "own": False,
+        }
+    else:
+        subject = _chooser_subject(items, outfits, output)
     pieces = subject["pieces"]
     if not pieces:
         st.caption("Picture size stays Small until there is a photo to compare.")
         return
-    key = tuple((name, image.size, image.mode) for name, image in pieces)
+    key = (mode, tuple((name, image.size, image.mode) for name, image in pieces))
     if st.session_state.get("quality_preview_key") != key:
         st.session_state["quality_preview_key"] = key
         st.session_state["quality_preview_rows"] = pi.preview_rows([image for _, image in pieces])
     rows = st.session_state["quality_preview_rows"]
     names = [name for name, _image in pieces]
     owned = 0
-    if not items.empty and "Image_Path" in items.columns:
+    if subject["own"] and not items.empty and "Image_Path" in items.columns:
         owned = int(items["Image_Path"].map(lambda value: bool(w.clean_path(value))).sum())
     st.subheader("Picture size")
-    st.caption(
-        "Small is the default. The color name is saved before the picture is compressed, so it stays the same at every size. "
-        + subject["label"]
-    )
+    if mode == "setup":
+        st.caption("Small keeps the closet smallest. Medium and High keep more detail and use more space.")
+        st.caption(subject["label"] + " The size under each piece is the file that would be saved.")
+    else:
+        st.caption(
+            "The color name is saved before the picture is compressed, so it stays the same at every size. "
+            + subject["label"]
+        )
     if subject["limited"]:
         st.caption("The original photo isn't available. A size larger than the saved picture stays at the detail you already have.")
     current = pi.current_preset()["id"]
@@ -1430,12 +1456,12 @@ def _render_quality_chooser(items: pd.DataFrame, outfits: pd.DataFrame, output: 
             if owned:
                 st.caption(f"Your {owned} pieces ≈ {pi.format_bytes(row['average'] * owned)}")
             st.caption(row["planning"])
-            already = row["id"] == current and chosen
+            already = row["id"] == current and chosen and mode != "setup"
             if already:
                 st.caption("New pictures use this size.")
             if st.button(
                 "Using this size" if already else f"Use {row['label']}",
-                key=f"quality_{row['id']}_{'top' if not chosen else 'stored'}",
+                key=f"quality_{row['id']}_{mode}",
                 disabled=already,
             ):
                 _apply_quality(items, output, row["id"])
@@ -1443,18 +1469,25 @@ def _render_quality_chooser(items: pd.DataFrame, outfits: pd.DataFrame, output: 
 
 def _apply_quality(items: pd.DataFrame, output: Path, preset_id: str) -> None:
     try:
+        first = not pi.quality_chosen()
         result = pi.apply_quality(output, preset_id)
         updated, _freed = w.reclaim_closet_photos(items, w.APP_DIR, preset=preset_id)
         if not updated.equals(items):
             w.save_items(updated, w.ITEMS_PATH)
         spec = pi.resolve_preset(preset_id)
         st.session_state.pop("quality_preview_key", None)
-        st.session_state["flash"] = (
-            "ok",
-            f"{spec['label']} is the picture size. "
-            f"{result['rebuilt']} rebuilt from the original photo, "
-            f"{result['shrunk']} made smaller, {result['kept']} left as they were.",
-        )
+        if first and result["rebuilt"] == 0 and result["shrunk"] == 0:
+            message = (
+                f"{spec['label']} is the picture size for every photo you import. "
+                "You can change it in Storage."
+            )
+        else:
+            message = (
+                f"{spec['label']} is the picture size. "
+                f"{result['rebuilt']} rebuilt from the original photo, "
+                f"{result['shrunk']} made smaller, {result['kept']} left as they were."
+            )
+        st.session_state["flash"] = ("ok", message)
     except (pi.PhotoImportError, w.WardrobeError) as exc:
         st.session_state["flash"] = ("err", str(exc))
     st.rerun()
