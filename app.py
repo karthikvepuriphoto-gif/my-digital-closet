@@ -1434,8 +1434,7 @@ def _render_quality_chooser(items: pd.DataFrame, outfits: pd.DataFrame, output: 
         owned = int(items["Image_Path"].map(lambda value: bool(w.clean_path(value))).sum())
     st.subheader("Picture size")
     if mode == "setup":
-        st.caption("Small keeps the closet smallest. Medium and High keep more detail and use more space.")
-        st.caption(subject["label"] + " The size under each piece is the file that would be saved.")
+        st.caption(subject["label"] + " The size under each piece is measured from that picture.")
     else:
         st.caption(
             "The color name is saved before the picture is compressed, so it stays the same at every size. "
@@ -1449,13 +1448,14 @@ def _render_quality_chooser(items: pd.DataFrame, outfits: pd.DataFrame, output: 
     for column, row in zip(columns, rows):
         with column:
             st.markdown(f"**{row['label']}**")
-            st.caption(f"{row['edge']} px · {row['aim']}")
+            st.caption(row["detail"])
+            st.caption(f"{row['edge']} px")
             for payload, name, size in zip(row["payloads"], names, row["sizes"]):
                 st.image(payload, caption=f"{name} · {pi.format_bytes(size)}")
-            st.caption(f"{pi.format_bytes(row['average'])} each")
+            for line in pi.storage_lines(row["average"], subject["own"]):
+                st.caption(line)
             if owned:
                 st.caption(f"Your {owned} pieces ≈ {pi.format_bytes(row['average'] * owned)}")
-            st.caption(row["planning"])
             already = row["id"] == current and chosen and mode != "setup"
             if already:
                 st.caption("New pictures use this size.")
@@ -1465,6 +1465,17 @@ def _render_quality_chooser(items: pd.DataFrame, outfits: pd.DataFrame, output: 
                 disabled=already,
             ):
                 _apply_quality(items, output, row["id"])
+    small = next((row["average"] for row in rows if row["id"] == "small"), 0)
+    high = next((row["average"] for row in rows if row["id"] == "high"), 0)
+    comparison = pi.space_comparison(small, high)
+    if comparison:
+        st.caption(comparison)
+    elif small and high and high <= small:
+        st.caption("Medium and High stay this size, because the saved picture cannot be made larger.")
+    if subject["own"]:
+        st.caption("The 100 and 1,000 item figures are estimates from the average size of your pictures.")
+    else:
+        st.caption("These are estimates measured on the sample outfit, until your closet has photos.")
 
 
 def _apply_quality(items: pd.DataFrame, output: Path, preset_id: str) -> None:

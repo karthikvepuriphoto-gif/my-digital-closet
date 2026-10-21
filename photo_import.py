@@ -71,9 +71,27 @@ COLOR_RGB = {
 # Long edge before detection. The saved crop is a separate choice.
 DETECT_EDGE = 640
 PRESETS = {
-    "small": {"id": "small", "label": "Small", "edge": 384, "quality": 80, "aim": "About 20–40 KB"},
-    "medium": {"id": "medium", "label": "Medium", "edge": 640, "quality": 80, "aim": "About 50–100 KB"},
-    "high": {"id": "high", "label": "High", "edge": 1024, "quality": 85, "aim": "About 150–300 KB"},
+    "small": {
+        "id": "small",
+        "label": "Small",
+        "edge": 384,
+        "quality": 80,
+        "detail": "Great for browsing and matching outfits; colors stay accurate, fine detail is softer.",
+    },
+    "medium": {
+        "id": "medium",
+        "label": "Medium",
+        "edge": 640,
+        "quality": 80,
+        "detail": "Fabric and edges are easier to see; a good fit if you look closely and still want the closet small.",
+    },
+    "high": {
+        "id": "high",
+        "label": "High",
+        "edge": 1024,
+        "quality": 85,
+        "detail": "The closest look when you zoom in; suits a smaller closet, or when you have room to spare.",
+    },
 }
 PRESET_LIST = [PRESETS["small"], PRESETS["medium"], PRESETS["high"]]
 CROP_EDGE = PRESETS["small"]["edge"]
@@ -429,6 +447,30 @@ def format_bytes(size: int) -> str:
 def projection_line(bytes_per_item: int, count: int = 1000) -> str:
     total = max(0, int(bytes_per_item)) * max(0, int(count))
     return f"~{int(count):,} items ≈ {format_bytes(total)}"
+
+
+def storage_lines(average: int, own: bool) -> list[str]:
+    """Average and closet-size examples from measured bytes, not a target band."""
+    per_item = max(0, int(average))
+    if per_item <= 0:
+        return []
+    kind = "Your average" if own else "Estimate"
+    return [
+        f"{kind} · {format_bytes(per_item)} each",
+        projection_line(per_item, 100),
+        projection_line(per_item, 1000),
+    ]
+
+
+def space_comparison(small_bytes: int, high_bytes: int) -> str:
+    small = max(0, int(small_bytes))
+    high = max(0, int(high_bytes))
+    if small <= 0 or high <= small:
+        return ""
+    ratio = high / small
+    nearest = round(ratio)
+    shown = str(nearest) if abs(ratio - nearest) < 0.05 else f"{ratio:.1f}"
+    return f"Small uses about {shown}× less space than High."
 
 
 def prefs_path(root: Path | None = None) -> Path:
@@ -1014,7 +1056,7 @@ def preview_rows(images: list[Image.Image]) -> list[dict]:
         rows.append({
             "id": spec["id"],
             "label": spec["label"],
-            "aim": spec["aim"],
+            "detail": spec["detail"],
             "edge": spec["edge"],
             "payloads": payloads,
             "sizes": [len(payload) for payload in payloads],

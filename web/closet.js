@@ -749,9 +749,27 @@ export function scaledCropBox(box, maskWidth, maskHeight, imageWidth, imageHeigh
 }
 
 export const QUALITY_PRESETS = [
-  { id: "small", label: "Small", edge: 384, quality: 0.8, aim: "About 20–40 KB" },
-  { id: "medium", label: "Medium", edge: 640, quality: 0.8, aim: "About 50–100 KB" },
-  { id: "high", label: "High", edge: 1024, quality: 0.85, aim: "About 150–300 KB" },
+  {
+    id: "small",
+    label: "Small",
+    edge: 384,
+    quality: 0.8,
+    detail: "Great for browsing and matching outfits; colors stay accurate, fine detail is softer.",
+  },
+  {
+    id: "medium",
+    label: "Medium",
+    edge: 640,
+    quality: 0.8,
+    detail: "Fabric and edges are easier to see; a good fit if you look closely and still want the closet small.",
+  },
+  {
+    id: "high",
+    label: "High",
+    edge: 1024,
+    quality: 0.85,
+    detail: "The closest look when you zoom in; suits a smaller closet, or when you have room to spare.",
+  },
 ];
 
 export function presetById(id) {
@@ -766,6 +784,27 @@ export function projectionLine(bytesPerItem, count = 1000) {
   const perItem = Math.max(0, Math.round(Number(bytesPerItem) || 0));
   const items = Math.max(0, Math.round(Number(count) || 0));
   return `~${formatCount(items)} items ≈ ${formatBytes(perItem * items)}`;
+}
+
+export function storageLines(bytesPerItem, own) {
+  const average = Math.max(0, Math.round(Number(bytesPerItem) || 0));
+  if (!average) return [];
+  const kind = own ? "Your average" : "Estimate";
+  return [
+    `${kind} · ${formatBytes(average)} each`,
+    projectionLine(average, 100),
+    projectionLine(average, 1000),
+  ];
+}
+
+export function spaceComparison(smallBytes, highBytes) {
+  const small = Math.max(0, Math.round(Number(smallBytes) || 0));
+  const high = Math.max(0, Math.round(Number(highBytes) || 0));
+  if (small <= 0 || high <= small) return "";
+  const ratio = high / small;
+  const nearest = Math.round(ratio);
+  const shown = Math.abs(ratio - nearest) < 0.05 ? String(nearest) : ratio.toFixed(1);
+  return `Small uses about ${shown}× less space than High.`;
 }
 
 export function storageReport({ items = [], garments = [], inbox = [] } = {}) {

@@ -438,6 +438,27 @@ class PhotoImportTests(unittest.TestCase):
             self.assertEqual(max(image.size), pi.PRESETS["high"]["edge"])
         self.assertEqual(pi.resolve_preset(None)["id"], "small")
         self.assertEqual(pi.projection_line(30 * 1024, 1000), "~1,000 items ≈ 29.3 MB")
+        self.assertEqual(
+            pi.storage_lines(16 * 1024, own=False),
+            ["Estimate · 16 KB each", "~100 items ≈ 1.6 MB", "~1,000 items ≈ 15.6 MB"],
+        )
+        self.assertEqual(pi.storage_lines(15 * 1024, own=True)[0], "Your average · 15 KB each")
+        self.assertEqual(pi.space_comparison(16 * 1024, 119 * 1024), "Small uses about 7.4× less space than High.")
+        self.assertIn("browsing and matching", pi.PRESETS["small"]["detail"])
+
+    def test_sample_outfit_storage_comes_from_the_encoder(self):
+        pieces = pi.sample_outfit()
+        self.assertGreaterEqual(len(pieces), 3)
+        rows = pi.preview_rows([image for _, image in pieces])
+        averages = {row["id"]: row["average"] for row in rows}
+        self.assertGreater(averages["medium"], averages["small"])
+        self.assertGreater(averages["high"], averages["medium"])
+        comparison = pi.space_comparison(averages["small"], averages["high"])
+        self.assertTrue(comparison.startswith("Small uses about "))
+        self.assertIn("less space than High.", comparison)
+        lines = pi.storage_lines(averages["small"], own=False)
+        self.assertIn("100 items", lines[1])
+        self.assertIn("1,000 items", lines[2])
 
     def test_changing_size_uses_the_source_and_does_not_invent_detail(self):
         with tempfile.TemporaryDirectory() as tmp:

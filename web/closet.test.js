@@ -19,6 +19,8 @@ import {
   formatBytes,
   presetById,
   projectionLine,
+  spaceComparison,
+  storageLines,
   QUALITY_PRESETS,
   scaledCropBox,
   scrubOutfits,
@@ -197,6 +199,16 @@ test("picture size defaults to small and projects a closet", () => {
   assert.equal(QUALITY_PRESETS[2].edge, 1024);
   assert.equal(projectionLine(30 * 1024, 1000), "~1,000 items ≈ 29.3 MB");
   assert.equal(projectionLine(24 * 1024, 12), "~12 items ≈ 288 KB");
+  assert.match(QUALITY_PRESETS[0].detail, /browsing and matching/);
+  assert.deepEqual(storageLines(16 * 1024, false), [
+    "Estimate · 16 KB each",
+    "~100 items ≈ 1.6 MB",
+    "~1,000 items ≈ 15.6 MB",
+  ]);
+  assert.equal(storageLines(15 * 1024, true)[0], "Your average · 15 KB each");
+  assert.equal(spaceComparison(16 * 1024, 119 * 1024), "Small uses about 7.4× less space than High.");
+  assert.equal(spaceComparison(10 * 1024, 70 * 1024), "Small uses about 7× less space than High.");
+  assert.equal(spaceComparison(0, 100), "");
 });
 
 test("file identity uses the relative path, size, and time", () => {

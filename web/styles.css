@@ -118,28 +118,32 @@ input, select {
 }
 
 .chooser { margin: 0.2rem 0 1rem; }
-.presets { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.4rem; align-items: stretch; }
+.presets { display: grid; grid-template-columns: 1fr; gap: 0.55rem; align-items: stretch; }
 .preset {
   display: flex;
   flex-direction: column;
-  gap: 0.15rem;
+  gap: 0.2rem;
   text-align: left;
   min-width: 0;
-  padding: 0.4rem;
+  padding: 0.75rem;
   border-radius: 14px;
   border: 1px solid #e4d9cc;
   background: #fff;
 }
 .preset[aria-pressed="true"] { border-color: #24382d; box-shadow: inset 0 0 0 1px #24382d; }
-.preset b { font-size: 0.92rem; }
-.preset span { color: #6e655c; font-size: 0.68rem; line-height: 1.25; }
+.preset b { font-size: 1rem; }
+.preset .detail { color: #221c18; font-size: 0.92rem; line-height: 1.35; }
+.preset span { color: #6e655c; font-size: 0.82rem; line-height: 1.3; }
+.preset-photos { display: flex; gap: 0.45rem; }
+.preset-photos figure { margin: 0; width: 76px; }
 .preset-photos img {
-  width: 100%;
-  height: 72px;
+  width: 76px;
+  height: 76px;
   object-fit: contain;
   background: #efeae3;
   border-radius: 8px;
 }
+.preset-photos figcaption { color: #6e655c; font-size: 0.72rem; line-height: 1.25; }
 
 .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
 .card { overflow: hidden; }

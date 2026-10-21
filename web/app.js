@@ -19,7 +19,8 @@ import {
   suggestLookName,
   formatBytes,
   presetById,
-  projectionLine,
+  spaceComparison,
+  storageLines,
   QUALITY_PRESETS,
   storageReport,
   swatchColor,
@@ -408,7 +409,7 @@ function renderSetup() {
     ${banner()}
     <p class="eyebrow">Setup</p>
     <h2>Choose a picture size</h2>
-    <p class="lede">This is the first step. The size you pick is saved and used for every photo you import. You can change it later in Settings.</p>
+    <p class="lede">This is the first step. The size you pick is saved and used for every photo you import. You can change it later in Settings. Each choice says what the picture looks like and how much space it uses.</p>
     ${qualityChooserHtml("setup")}`;
 }
 
@@ -421,26 +422,40 @@ function qualityChooserHtml(mode) {
     const preset = column.preset;
     const selected = state.qualityChosen && state.cropQuality === preset.id;
     const photos = column.files.map((file) => `
-      <img src="${blobUrl(`preview-${preset.id}-${file.name}`, file.blob)}" alt="">
-      <span>${escapeHtml(file.name)} · ${formatBytes(file.bytes)}</span>`).join("");
+      <figure>
+        <img src="${blobUrl(`preview-${preset.id}-${file.name}`, file.blob)}" alt="">
+        <figcaption>${escapeHtml(file.name)} · ${formatBytes(file.bytes)}</figcaption>
+      </figure>`).join("");
     const average = column.average || 0;
+    const lines = storageLines(average, Boolean(preview?.own)).map((line) => `<span>${escapeHtml(line)}</span>`).join("");
+    const yours = average && owned && !setup && preview?.own
+      ? `<span>Your ${owned} ${owned === 1 ? "piece" : "pieces"} ≈ ${formatBytes(average * owned)}</span>`
+      : "";
     return `
       <button type="button" class="preset" data-action="quality" data-id="${preset.id}" aria-pressed="${selected}">
         <b>${escapeHtml(preset.label)}</b>
-        <span>${preset.edge} px · ${escapeHtml(preset.aim)}</span>
+        <span class="detail">${escapeHtml(preset.detail)}</span>
+        <span>${preset.edge} px</span>
         <div class="preset-photos">${photos || `<span>${preview?.loading ? "Preparing…" : ""}</span>`}</div>
-        ${average ? `<span>${formatBytes(average)} each</span>` : ""}
-        ${average && owned && !setup && preview?.own ? `<span>Your ${owned} ${owned === 1 ? "piece" : "pieces"} ≈ ${formatBytes(average * owned)}</span>` : ""}
-        ${average ? `<span>${projectionLine(average, 1000)}</span>` : ""}
+        ${lines}
+        ${yours}
         <span>${selected ? "New pictures use this size." : "Use this size"}</span>
       </button>`;
   }).join("");
+  const small = columns.find((column) => column.preset.id === "small")?.average || 0;
+  const high = columns.find((column) => column.preset.id === "high")?.average || 0;
+  const comparison = spaceComparison(small, high);
   const limited = !setup && preview?.limited
     ? `<p class="hint">The original photo isn't available, so a larger size can't get sharper than the picture already saved.</p>`
     : "";
   const lede = setup
-    ? "The sample outfit below is not saved in your closet. Each column is that outfit at one size, with the real file size and an estimate for about 1,000 pieces."
+    ? "The sample outfit is not saved in your closet. File sizes are measured on this phone."
     : "The color is saved before the picture is compressed, so it stays the same at every size.";
+  const basis = preview?.columns?.length
+    ? (preview.own
+      ? "The 100 and 1,000 item figures are estimates from the average size of your pictures."
+      : "These are estimates measured on the sample outfit, until your closet has photos.")
+    : "";
   return `
     <section class="chooser" aria-label="Picture size">
       ${setup ? "" : "<h2>Picture size</h2>"}
@@ -448,6 +463,9 @@ function qualityChooserHtml(mode) {
       <p class="meta">${escapeHtml(preview?.label || (setup ? "Sample outfit." : "Comparing picture sizes."))}</p>
       ${limited}
       <div class="presets">${cards}</div>
+      ${comparison ? `<p class="meta">${escapeHtml(comparison)}</p>` : ""}
+      ${!comparison && small && high && high <= small ? `<p class="hint">Medium and High stay this size, because the saved picture cannot be made larger.</p>` : ""}
+      ${basis ? `<p class="hint">${escapeHtml(basis)}</p>` : ""}
     </section>`;
 }
 
