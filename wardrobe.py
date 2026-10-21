@@ -46,7 +46,7 @@ PIECE_COLUMNS = [
     "Footwear_ID",
 ]
 
-CATEGORIES = ["Tops", "Bottoms", "Full Body", "Outerwear", "Footwear"]
+CATEGORIES = ["Tops", "Bottoms", "Full Body", "Outerwear", "Footwear", "Accessories"]
 COLORS = [
     "Black",
     "White",
@@ -71,6 +71,7 @@ _CATEGORY_WORDS = {
     "Full Body": "one-piece clothes",
     "Outerwear": "outerwear",
     "Footwear": "shoes",
+    "Accessories": "accessories",
 }
 
 

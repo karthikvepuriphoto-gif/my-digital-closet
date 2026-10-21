@@ -1,0 +1,754 @@
+"""Import a wardrobe from a local folder of photos.
+
+Photos are read and never written. Crops go to a separate folder. Nothing is
+added to the closet until a person approves it. Model code lives in
+import_models.py and is not imported here, so the rest of the app still runs
+if PyTorch is not installed.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageOps, UnidentifiedImageError
+
+import wardrobe as w
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+DUPLICATE_SIMILARITY = 0.90
+SAME_GARMENT_ACROSS_LABELS = 0.95
+DEFAULT_OUTPUT = w.APP_DIR / "imported_wardrobe"
+LIBRARY_NAME = "library.json"
+
+# Closet category, output folder, short name, confidence.
+LABEL_INFO = {
+    "upper-clothes": ("Tops", "tops", "top", 0.8),
+    "skirt": ("Bottoms", "bottoms", "skirt", 0.75),
+    "pants": ("Bottoms", "bottoms", "pants", 0.85),
+    "dress": ("Full Body", "dresses", "dress", 0.75),
+    "hat": ("Accessories", "accessories", "hat", 0.7),
+    "sunglasses": ("Accessories", "accessories", "sunglasses", 0.7),
+    "belt": ("Accessories", "accessories", "belt", 0.45),
+    "left-shoe": ("Footwear", "shoes", "shoe", 0.7),
+    "right-shoe": ("Footwear", "shoes", "shoe", 0.7),
+    "bag": ("Accessories", "accessories", "bag", 0.7),
+    "scarf": ("Accessories", "accessories", "scarf", 0.55),
+    "coat": ("Outerwear", "outerwear", "coat", 0.85),
+    "jacket": ("Outerwear", "outerwear", "jacket", 0.85),
+}
+GARMENT_LABELS = set(LABEL_INFO)
+FOLDER_BY_CATEGORY = {
+    "Tops": "tops",
+    "Bottoms": "bottoms",
+    "Full Body": "dresses",
+    "Outerwear": "outerwear",
+    "Footwear": "shoes",
+    "Accessories": "accessories",
+}
+COLOR_RGB = {
+    "Black": (20, 20, 20),
+    "White": (245, 245, 245),
+    "Grey": (140, 140, 140),
+    "Beige": (210, 190, 160),
+    "Brown": (110, 70, 40),
+    "Blue": (50, 90, 170),
+    "Navy": (20, 35, 80),
+    "Green": (40, 110, 60),
+    "Red": (180, 40, 40),
+    "Pink": (230, 150, 170),
+    "Yellow": (230, 200, 60),
+    "Orange": (220, 120, 40),
+    "Purple": (110, 70, 150),
+}
+
+
+class PhotoImportError(Exception):
+    """The import could not continue safely."""
+
+
+@dataclass
+class Region:
+    label: str
+    category: str
+    folder: str
+    friendly: str
+    crop: Image.Image
+    confidence: float
+
+
+@dataclass
+class ScanProgress:
+    done: int
+    total: int
+    waiting: int
+    current: str
+    found: int
+    message: str
+
+
+@dataclass
+class ClothesFinder:
+    """Finds garment crops in one image. Tests pass a fake."""
+
+    def find(self, image: Image.Image) -> list[Region]:
+        return []
+
+
+@dataclass
+class Embedder:
+    def embed(self, image: Image.Image) -> list[float]:
+        return []
+
+
+def privacy_summary() -> str:
+    return (
+        "Your pictures stay on this computer. The scan only reads them, "
+        "and it never uploads them, sends them to a cloud service, or edits them. "
+        "The clothing model is downloaded once into a folder next to the app, then runs here. "
+        "Telemetry from the model tools is turned off. "
+        "Crops are written to a separate folder. "
+        "Nothing is added to the closet until you approve it."
+    )
+
+
+def ensure_separate_folders(source: Path, output: Path) -> tuple[Path, Path]:
+    """Refuse a crops folder that could let us write into the photo folder."""
+    source = source.expanduser().resolve()
+    output = output.expanduser().resolve()
+    if not source.is_dir():
+        raise PhotoImportError(f"That photo folder does not exist: {source}")
+    if output == source or _is_relative_to(output, source) or _is_relative_to(source, output):
+        raise PhotoImportError(
+            "Pick a crops folder that is outside the photo folder. "
+            "Original photos are never moved or modified."
+        )
+    return source, output
+
+
+def list_images(source: Path, output: Path) -> list[Path]:
+    found = []
+    for path in source.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.name.startswith("."):
+            continue
+        if path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        resolved = path.resolve()
+        if _is_relative_to(resolved, output):
+            continue
+        found.append(resolved)
+    return sorted(found, key=lambda item: str(item).lower())
+
+
+def needs_scan(state: dict, path: Path) -> bool:
+    record = state["files"].get(str(path))
+    if not record:
+        return True
+    size, mtime_ns = _signature(path)
+    return record.get("size") != size or record.get("mtime_ns") != mtime_ns
+
+
+def scan_folder(
+    source: Path,
+    output: Path,
+    finder: ClothesFinder,
+    embedder: Embedder,
+    *,
+    limit: int | None = None,
+):
+    """Scan new or changed photos. Yields progress. Original files are not opened for writing."""
+    source, output = ensure_separate_folders(source, output)
+    _prepare_output(output)
+    state = load_state(output)
+    images = list_images(source, output)
+    waiting = [path for path in images if needs_scan(state, path)]
+    batch = waiting if limit is None else waiting[: max(0, limit)]
+    found = 0
+    total = len(batch)
+    if total == 0:
+        yield ScanProgress(
+            done=0,
+            total=0,
+            waiting=0,
+            current="",
+            found=0,
+            message="No new photos to scan. Unchanged pictures are left as they are.",
+        )
+        return
+    for index, path in enumerate(batch, start=1):
+        before = path.read_bytes()
+        signature = _signature(path)
+        error = ""
+        regions: list[Region] = []
+        try:
+            image = _image_from_bytes(before)
+            regions = list(finder.find(image))
+        except (UnidentifiedImageError, OSError, PhotoImportError) as exc:
+            error = str(exc)
+        after = path.read_bytes()
+        if after != before or _signature(path) != signature:
+            raise PhotoImportError(
+                f"Stopped because {path.name} changed during the scan. "
+                "Original photos are not supposed to be touched."
+            )
+        new_ids: list[str] = []
+        for region in regions:
+            garment_id, created = _record_region(state, output, path, region, embedder)
+            if garment_id and garment_id not in new_ids:
+                new_ids.append(garment_id)
+            if created:
+                found += 1
+        state["files"][str(path)] = {
+            "size": signature[0],
+            "mtime_ns": signature[1],
+            "sha256": hashlib.sha256(before).hexdigest(),
+            "error": error,
+            "garment_ids": new_ids,
+            "scanned_at": _now(),
+        }
+        save_state(output, state)
+        remaining = len(waiting) - index
+        detail = error or f"found {len(new_ids)}"
+        yield ScanProgress(
+            done=index,
+            total=total,
+            waiting=remaining,
+            current=path.name,
+            found=found,
+            message=f"Scanning {index} of {total} ({remaining} still waiting): {path.name} — {detail}",
+        )
+
+
+def pending_garments(output: Path) -> list[dict]:
+    state = load_state(output)
+    rows = [dict(row, id=garment_id) for garment_id, row in state["garments"].items() if row.get("status") == "pending"]
+    rows.sort(key=lambda row: row.get("created", ""), reverse=True)
+    return rows
+
+
+def import_counts(source: Path | None, output: Path) -> dict[str, int]:
+    state = load_state(output) if output.exists() else _empty_state()
+    garments = list(state["garments"].values())
+    waiting = 0
+    if source and source.expanduser().exists():
+        try:
+            source, output = ensure_separate_folders(source, output)
+            waiting = sum(1 for path in list_images(source, output) if needs_scan(state, path))
+        except PhotoImportError:
+            waiting = 0
+    return {
+        "waiting": waiting,
+        "pending": sum(1 for row in garments if row.get("status") == "pending"),
+        "approved": sum(1 for row in garments if row.get("status") == "approved"),
+        "rejected": sum(1 for row in garments if row.get("status") == "rejected"),
+        "scanned": len(state["files"]),
+    }
+
+
+def approve_garment(
+    output: Path,
+    garment_id: str,
+    items: pd.DataFrame,
+    outfits: pd.DataFrame,
+    *,
+    name: str,
+    category: str,
+    color: str,
+    season: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    output = output.expanduser().resolve()
+    state = load_state(output)
+    garment = state["garments"].get(garment_id)
+    if garment is None or garment.get("status") != "pending":
+        raise PhotoImportError("That detection is no longer waiting for review.")
+    if category not in FOLDER_BY_CATEGORY:
+        raise PhotoImportError("Pick a category from the closet list.")
+    cleaned = name.strip()
+    if not cleaned:
+        raise PhotoImportError("Enter a name before approving.")
+    folder = FOLDER_BY_CATEGORY[category]
+    destination = output / folder / Path(garment["crop_path"]).name
+    moved = _move_our_file(Path(garment["crop_path"]), destination, output)
+    items = w.add_item(
+        items,
+        outfits,
+        category=category,
+        sub_category=cleaned,
+        color=color,
+        season=season,
+        image_path=str(moved),
+    )
+    closet_id = int(items.iloc[-1]["ID"])
+    sources = list(garment.get("sources") or [])
+    items = w.update_item(
+        items,
+        closet_id,
+        Source_Photo=sources[0] if sources else "",
+        Source_Photos="|".join(sources),
+    )
+    garment.update(
+        {
+            "status": "approved",
+            "name": cleaned[:80],
+            "category": category,
+            "folder": folder,
+            "color": color,
+            "season": season,
+            "crop_path": str(moved),
+            "closet_id": closet_id,
+        }
+    )
+    save_state(output, state)
+    return items, outfits
+
+
+def reject_garment(output: Path, garment_id: str) -> None:
+    output = output.expanduser().resolve()
+    state = load_state(output)
+    garment = state["garments"].get(garment_id)
+    if garment is None or garment.get("status") != "pending":
+        raise PhotoImportError("That detection is no longer waiting for review.")
+    _delete_our_file(Path(garment.get("crop_path", "")), output)
+    garment["status"] = "rejected"
+    garment["crop_path"] = ""
+    save_state(output, state)
+
+
+def nearest_color(image: Image.Image) -> str:
+    small = image.convert("RGB").resize((48, 48))
+    pixels = np.asarray(small, dtype=np.float32).reshape(-1, 3)
+    palette = list(COLOR_RGB.items())
+    counts = {name: 0 for name, _ in palette}
+    # Step through the thumbnail so a few odd pixels don't decide the color.
+    for pixel in pixels[::2]:
+        name = min(palette, key=lambda item: float(np.linalg.norm(pixel - np.array(item[1]))))[0]
+        counts[name] += 1
+    return max(counts, key=counts.get)
+
+
+def _label_key(label: str) -> str:
+    return label.strip().lower().replace("_", "-").replace(" ", "-")
+
+
+def classify_label(label: str, box: tuple[int, int, int, int], person_box: tuple[int, int, int, int]) -> tuple[str, str, str, float]:
+    """Map a model label to a closet category. Long tops are suggested as outerwear."""
+    key = _label_key(label)
+    if key not in LABEL_INFO:
+        raise PhotoImportError(f"Unknown clothing label: {label}")
+    category, folder, friendly, confidence = LABEL_INFO[key]
+    if key == "upper-clothes":
+        y0, _, y1, _ = box
+        py0, _, py1, _ = person_box
+        garment_h = max(1, y1 - y0)
+        person_h = max(1, py1 - py0)
+        ratio = garment_h / person_h
+        reaches_low = y1 >= py0 + person_h * 0.72
+        # A coat is long on a person, but still shorter than the whole figure.
+        # When the garment is the entire foreground, keep the top suggestion.
+        if 0.62 <= ratio < 0.92 and reaches_low:
+            return "Outerwear", "outerwear", "coat", 0.5
+    return category, folder, friendly, confidence
+
+
+def regions_from_mask(mask: np.ndarray, original: Image.Image, id2label: dict) -> list[Region]:
+    """Turn a segmentation mask into garment crops from the original photo."""
+    if mask.ndim != 2:
+        raise PhotoImportError("The clothing mask has the wrong shape.")
+    mask_h, mask_w = mask.shape
+    orig_w, orig_h = original.size
+    scale_x = orig_w / mask_w
+    scale_y = orig_h / mask_h
+    labels = {int(key): str(value) for key, value in id2label.items()}
+    person = mask > 0
+    if person.any():
+        ys, xs = np.where(person)
+        person_box = (int(ys.min()), int(xs.min()), int(ys.max()) + 1, int(xs.max()) + 1)
+    else:
+        person_box = (0, 0, mask_h, mask_w)
+    min_pixels = max(400, int(0.012 * mask_h * mask_w))
+    regions: list[Region] = []
+    shoe_boxes: list[tuple[str, tuple[int, int, int, int], float]] = []
+    for label_id, name in labels.items():
+        key = _label_key(name)
+        if key not in GARMENT_LABELS:
+            continue
+        boxes = component_boxes(mask == label_id, min_pixels)
+        for box, _area in boxes:
+            category, folder, friendly, confidence = classify_label(name, box, person_box)
+            if key in {"left-shoe", "right-shoe"}:
+                shoe_boxes.append((name, box, confidence))
+                continue
+            crop = _crop_original(original, box, scale_x, scale_y)
+            if crop is None:
+                continue
+            regions.append(
+                Region(name, category, folder, friendly, crop, confidence)
+            )
+    merged = _merge_shoe_boxes(shoe_boxes)
+    for name, box, confidence in merged:
+        crop = _crop_original(original, box, scale_x, scale_y)
+        if crop is None:
+            continue
+        category, folder, friendly, confidence = classify_label(name, box, person_box)
+        if len(merged) == 1 and len(shoe_boxes) == 2:
+            friendly = "shoes"
+        regions.append(Region(name, category, folder, friendly, crop, confidence))
+    return regions
+
+
+def component_boxes(mask: np.ndarray, min_pixels: int) -> list[tuple[tuple[int, int, int, int], int]]:
+    """Connected components as (y0, x0, y1, x1), area. y1 and x1 are exclusive."""
+    labeled, count = _label_mask(mask.astype(bool))
+    boxes = []
+    for label_id in range(1, count + 1):
+        ys, xs = np.where(labeled == label_id)
+        area = int(len(ys))
+        if area < min_pixels:
+            continue
+        boxes.append(((int(ys.min()), int(xs.min()), int(ys.max()) + 1, int(xs.max()) + 1), area))
+    return boxes
+
+
+def load_state(output: Path) -> dict:
+    path = output / LIBRARY_NAME
+    if not path.exists():
+        return _empty_state()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PhotoImportError(f"Could not read the import notes in {path.name}: {exc}") from exc
+    data.setdefault("version", 1)
+    data.setdefault("files", {})
+    data.setdefault("garments", {})
+    return data
+
+
+def save_state(output: Path, state: dict) -> None:
+    output.mkdir(parents=True, exist_ok=True)
+    destination = output / LIBRARY_NAME
+    temporary = output / f".{LIBRARY_NAME}.tmp"
+    temporary.write_text(json.dumps(state, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(destination)
+
+
+def suggest_name(color: str, friendly: str) -> str:
+    return f"{color} {friendly}".strip()[:80]
+
+
+def similarity(left: list[float], right: list[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    first = np.asarray(left, dtype=np.float32)
+    second = np.asarray(right, dtype=np.float32)
+    denom = float(np.linalg.norm(first) * np.linalg.norm(second))
+    if denom == 0:
+        return 0.0
+    return float(np.dot(first, second) / denom)
+
+
+def _record_region(state: dict, output: Path, source: Path, region: Region, embedder: Embedder) -> tuple[str | None, bool]:
+    color = nearest_color(region.crop)
+    embedding = [round(float(value), 5) for value in embedder.embed(region.crop)]
+    match = _find_duplicate(state, region.category, embedding)
+    if match is not None:
+        sources = match.setdefault("sources", [])
+        source_text = str(source)
+        if source_text not in sources:
+            sources.append(source_text)
+        return match.get("id"), False
+    garment_id = uuid.uuid4().hex[:12]
+    crop_path = output / "pending" / f"{garment_id}.png"
+    _save_crop(region.crop, crop_path, output)
+    state["garments"][garment_id] = {
+        "id": garment_id,
+        "status": "pending",
+        "name": suggest_name(color, region.friendly),
+        "category": region.category,
+        "folder": region.folder,
+        "color": color,
+        "season": "All",
+        "label": region.label,
+        "friendly": region.friendly,
+        "confidence": round(float(region.confidence), 3),
+        "crop_path": str(crop_path.resolve()),
+        "sources": [str(source)],
+        "embedding": embedding,
+        "closet_id": None,
+        "created": _now(),
+    }
+    return garment_id, True
+
+
+def refresh_source_links(items: pd.DataFrame, output: Path) -> pd.DataFrame:
+    """Copy newly seen source photos onto closet rows that were already approved."""
+    if not output.exists():
+        return items
+    state = load_state(output)
+    updates: list[tuple[int, str, str]] = []
+    for garment in state["garments"].values():
+        closet_id = garment.get("closet_id")
+        if garment.get("status") != "approved" or not closet_id:
+            continue
+        sources = [str(item) for item in garment.get("sources") or [] if str(item)]
+        if not sources:
+            continue
+        updates.append((int(closet_id), sources[0], "|".join(sources)))
+    if not updates:
+        return items
+
+    def current(column: str, closet_id: int) -> str | None:
+        if column not in items.columns:
+            return None
+        mask = items["ID"] == closet_id
+        if not bool(mask.any()):
+            return ""
+        return str(items.loc[mask, column].iloc[0])
+
+    needed = False
+    for closet_id, first, joined in updates:
+        if not bool((items["ID"] == closet_id).any()):
+            continue
+        if current("Source_Photo", closet_id) != first or current("Source_Photos", closet_id) != joined:
+            needed = True
+            break
+    if not needed:
+        return items
+    items = items.copy()
+    if "Source_Photo" not in items.columns:
+        items["Source_Photo"] = ""
+    if "Source_Photos" not in items.columns:
+        items["Source_Photos"] = ""
+    for closet_id, first, joined in updates:
+        mask = items["ID"] == closet_id
+        if not bool(mask.any()):
+            continue
+        items.loc[mask, "Source_Photo"] = first
+        items.loc[mask, "Source_Photos"] = joined
+    return items
+
+
+def _find_duplicate(state: dict, category: str, embedding: list[float]) -> dict | None:
+    best = None
+    best_score = 0.0
+    for garment in state["garments"].values():
+        if garment.get("status") not in {"pending", "approved", "rejected"}:
+            continue
+        score = similarity(embedding, garment.get("embedding") or [])
+        if score < best_score:
+            continue
+        if not _is_same_item(category, garment.get("category", ""), score):
+            continue
+        best = garment
+        best_score = score
+    return best
+
+
+def _is_same_item(left: str, right: str, score: float) -> bool:
+    if score < DUPLICATE_SIMILARITY:
+        return False
+    if left == right:
+        return True
+    return {left, right} == {"Tops", "Outerwear"} and score >= SAME_GARMENT_ACROSS_LABELS
+
+
+def _prepare_output(output: Path) -> None:
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "pending").mkdir(exist_ok=True)
+        for folder in FOLDER_BY_CATEGORY.values():
+            (output / folder).mkdir(exist_ok=True)
+    except OSError as exc:
+        raise PhotoImportError(f"Could not create the crops folder: {exc}") from exc
+
+
+def _empty_state() -> dict:
+    return {"version": 1, "files": {}, "garments": {}}
+
+
+def _save_crop(image: Image.Image, path: Path, output: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _require_inside(path, output)
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, "PNG")
+    # Write our crop only after the safety check, via a temp file in the output folder.
+    temporary = path.with_name(f".{path.name}.tmp")
+    _require_inside(temporary, output)
+    temporary.write_bytes(buffer.getvalue())
+    temporary.replace(path)
+
+
+def _move_our_file(source: Path, destination: Path, output: Path) -> Path:
+    source = source.expanduser()
+    destination = destination.expanduser()
+    _require_inside(source, output)
+    _require_inside(destination, output)
+    if not source.is_file():
+        raise PhotoImportError("The crop for that detection is missing.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and destination.resolve() != source.resolve():
+        destination = destination.with_name(f"{destination.stem}-{uuid.uuid4().hex[:6]}{destination.suffix}")
+        _require_inside(destination, output)
+    source.replace(destination)
+    return destination.resolve()
+
+
+def _delete_our_file(path: Path, output: Path) -> None:
+    if not str(path):
+        return
+    try:
+        _require_inside(path, output)
+    except PhotoImportError:
+        return
+    if path.is_file():
+        path.unlink()
+
+
+def _require_inside(path: Path, root: Path) -> None:
+    try:
+        path.expanduser().resolve().relative_to(root.expanduser().resolve())
+    except ValueError as exc:
+        raise PhotoImportError("Refusing to write outside the crops folder.") from exc
+
+
+def _crop_original(original: Image.Image, box: tuple[int, int, int, int], scale_x: float, scale_y: float) -> Image.Image | None:
+    y0, x0, y1, x1 = box
+    left = x0 * scale_x
+    upper = y0 * scale_y
+    right = x1 * scale_x
+    lower = y1 * scale_y
+    pad_x = (right - left) * 0.08
+    pad_y = (lower - upper) * 0.08
+    width, height = original.size
+    left = int(max(0, left - pad_x))
+    upper = int(max(0, upper - pad_y))
+    right = int(min(width, right + pad_x))
+    lower = int(min(height, lower + pad_y))
+    if right - left < 48 or lower - upper < 48:
+        return None
+    return original.crop((left, upper, right, lower))
+
+
+def _merge_shoe_boxes(shoes: list[tuple[str, tuple[int, int, int, int], float]]) -> list[tuple[str, tuple[int, int, int, int], float]]:
+    left = [item for item in shoes if item[0].lower().startswith("left")]
+    right = [item for item in shoes if item[0].lower().startswith("right")]
+    if len(left) == 1 and len(right) == 1 and len(shoes) == 2:
+        _, first, first_conf = left[0]
+        _, second, second_conf = right[0]
+        union = (
+            min(first[0], second[0]),
+            min(first[1], second[1]),
+            max(first[2], second[2]),
+            max(first[3], second[3]),
+        )
+        return [("Right-shoe", union, max(first_conf, second_conf))]
+    return [(name, box, confidence) for name, box, confidence in shoes]
+
+
+def _label_mask(mask: np.ndarray) -> tuple[np.ndarray, int]:
+    height, width = mask.shape
+    labels = np.zeros((height, width), dtype=np.int32)
+    parent = [0]
+
+    def find(value: int) -> int:
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    current = 0
+    for y in range(height):
+        for x in range(width):
+            if not mask[y, x]:
+                continue
+            left = int(labels[y, x - 1]) if x else 0
+            up = int(labels[y - 1, x]) if y else 0
+            if left and up and left != up:
+                labels[y, x] = left
+                parent[find(up)] = find(left)
+            elif left or up:
+                labels[y, x] = left or up
+            else:
+                current += 1
+                parent.append(current)
+                labels[y, x] = current
+    roots = {}
+    next_id = 0
+    for y, x in zip(*np.where(labels > 0)):
+        root = find(int(labels[y, x]))
+        if root not in roots:
+            next_id += 1
+            roots[root] = next_id
+        labels[y, x] = roots[root]
+    return labels, next_id
+
+
+def _image_from_bytes(data: bytes) -> Image.Image:
+    with Image.open(io.BytesIO(data)) as incoming:
+        turned = ImageOps.exif_transpose(incoming)
+        turned.load()
+        return turned.convert("RGB")
+
+
+def _signature(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _cli(argv: list[str] | None = None) -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="Import a wardrobe from local photos.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("download-models", help="Download the clothing model once, then run it offline.")
+    scan = commands.add_parser("scan", help="Scan a folder of pictures into a separate crops folder.")
+    scan.add_argument("--source", required=True, help="Folder of pictures. Files in here are only read.")
+    scan.add_argument("--output", default=str(DEFAULT_OUTPUT), help="Crops folder, outside the photo folder.")
+    scan.add_argument("--limit", type=int, default=None, help="How many new photos to scan this time.")
+    args = parser.parse_args(argv)
+    try:
+        import import_models
+
+        if args.command == "download-models":
+            import_models.download_models()
+            print("Models saved on this computer. Later scans can run offline.")
+            return 0
+        finder, embedder = import_models.load_engines()
+        updates = scan_folder(
+            Path(args.source),
+            Path(args.output),
+            finder,
+            embedder,
+            limit=args.limit,
+        )
+        for update in updates:
+            print(update.message, flush=True)
+    except PhotoImportError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_cli())

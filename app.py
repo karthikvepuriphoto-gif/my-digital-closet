@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import html
 from datetime import datetime
+from pathlib import Path
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
+import photo_import as pi
 import wardrobe as w
 
-PAGES = ["Closet", "Add", "Outfits", "Insights"]
+PAGES = ["Closet", "Add", "Outfits", "Insights", "Import"]
 SORTS = ["Recently added", "Name", "Color"]
 SLOT_FIELDS = [
     ("Outerwear_ID", "Layer"),
@@ -200,6 +202,13 @@ def inject_css() -> None:
             border-radius: 10px;
             background: #efeae3;
           }
+          .st-key-import_review [data-testid="stImage"] img {
+            width: 100%;
+            height: 260px;
+            object-fit: contain;
+            border-radius: 14px;
+            background: #efeae3;
+          }
           [data-testid="stVerticalBlockBorderWrapper"] {
             background: #fffcf8;
             border-color: #e4d9cc !important;
@@ -235,6 +244,8 @@ def main() -> None:
         page_outfits(items, outfits)
     elif page == "Insights":
         page_insights(items, outfits)
+    elif page == "Import":
+        page_import(items, outfits)
     else:
         page_closet(items)
 
@@ -246,6 +257,7 @@ def render_nav() -> str:
         key="nav",
         label_visibility="collapsed",
         width="stretch",
+        wrap=True,
     )
     if page not in PAGES:
         page = "Closet"
@@ -914,7 +926,13 @@ def option_label(frame: pd.DataFrame, item_id: int) -> str:
 def meta_line(row: pd.Series) -> str:
     season = str(row["Season"])
     season_text = "All seasons" if season == "All" else season
-    return f"{row['Category']} · {row['Primary Color']} · {season_text}"
+    line = f"{row['Category']} · {row['Primary Color']} · {season_text}"
+    source = ""
+    if "Source_Photo" in row.index:
+        source = w.clean_path(row["Source_Photo"])
+    if source:
+        line += f" · from {Path(source).name}"
+    return line
 
 
 def look_meta(outfit: pd.Series, pieces: list[tuple[str, pd.Series]]) -> str:
@@ -975,6 +993,344 @@ def _with_current(options: list[str], current: str) -> list[str]:
 def _ensure_choice(key: str, options: list[str], fallback: str) -> None:
     if key not in st.session_state or st.session_state[key] not in options:
         st.session_state[key] = fallback if fallback in options else options[0]
+
+
+def page_import(items: pd.DataFrame, outfits: pd.DataFrame) -> None:
+    import import_models
+
+    page_title(
+        "Import from photos",
+        "Point at a folder of pictures. Suggestions stay here until you approve them.",
+    )
+    st.markdown(
+        f'<div class="banner ok">{html.escape(pi.privacy_summary())}</div>',
+        unsafe_allow_html=True,
+    )
+    installed, _message = import_models.packages_ready()
+    if not installed:
+        empty_block(
+            "Install the local model tools",
+            "Photo import needs PyTorch on this computer. The rest of the closet keeps working without it.",
+        )
+        st.code(import_models.INSTALL_HINT, language="bash")
+        return
+
+    if "import_output" not in st.session_state:
+        st.session_state["import_output"] = str(pi.DEFAULT_OUTPUT)
+    st.session_state.setdefault("import_source", "")
+    st.text_input(
+        "Photo folder",
+        key="import_source",
+        placeholder="/home/you/Pictures",
+        help="These files are only read. They are not moved, renamed, or edited.",
+    )
+    st.text_input(
+        "Crops folder",
+        key="import_output",
+        help="Must sit outside the photo folder. Approved crops are sorted into category folders.",
+    )
+    source_text = str(st.session_state.get("import_source", "")).strip()
+    output_text = str(st.session_state.get("import_output", "")).strip()
+    source = Path(source_text).expanduser() if source_text else None
+    output = Path(output_text).expanduser() if output_text else pi.DEFAULT_OUTPUT
+
+    if not import_models.models_ready():
+        st.caption(
+            "The clothing model is saved in model_cache next to the app. "
+            "The download happens once. Later scans do not use the network."
+        )
+        if st.button("Download models", type="primary", key="download_models"):
+            _download_import_models()
+        return
+
+    st.caption("Model is on this computer. This scan does not upload photos or phone home.")
+    try:
+        counts = pi.import_counts(source, output)
+    except pi.PhotoImportError as exc:
+        st.error(str(exc))
+        counts = {"waiting": 0, "pending": 0, "approved": 0, "scanned": 0}
+    st.caption(
+        f"{counts['waiting']} photos waiting · {counts['pending']} to review · "
+        f"{counts['approved']} approved · {counts['scanned']} already scanned"
+    )
+    _mention_unreadable(output)
+    scan_next, scan_all = st.columns(2)
+    with scan_next:
+        go_next = st.button("Scan next 8", type="primary", key="scan_next", width="stretch")
+    with scan_all:
+        go_all = st.button("Scan all remaining", key="scan_all", width="stretch")
+    if go_next or go_all:
+        _run_import_scan(items, source, output, 8 if go_next else None)
+
+    items = _sync_import_links(items, output)
+    _render_import_review(items, outfits, output)
+
+
+def _download_import_models() -> None:
+    import import_models
+
+    try:
+        with st.spinner("Downloading the clothing model. This happens once."):
+            import_models.download_models()
+    except pi.PhotoImportError as exc:
+        st.session_state["flash"] = ("err", str(exc))
+    else:
+        st.session_state["flash"] = ("ok", "Model saved on this computer. Scans can run offline now.")
+    st.rerun()
+
+
+@st.cache_resource
+def import_engines():
+    import import_models
+
+    return import_models.load_engines()
+
+
+def _run_import_scan(items: pd.DataFrame, source: Path | None, output: Path, limit: int | None) -> None:
+    if source is None:
+        st.session_state["flash"] = ("err", "Enter the folder that holds your pictures.")
+        st.rerun()
+    try:
+        finder, embedder = import_engines()
+        slot = st.progress(0.0, text="Starting the scan")
+        last = None
+        for update in pi.scan_folder(source, output, finder, embedder, limit=limit):
+            last = update
+            fraction = 1.0 if not update.total else min(1.0, update.done / update.total)
+            slot.progress(fraction, text=update.message)
+        linked = pi.refresh_source_links(items, output)
+        if linked is not items:
+            w.save_items(linked, w.ITEMS_PATH)
+        message = last.message if last else "Scan finished."
+        st.session_state["flash"] = ("ok", message)
+    except (pi.PhotoImportError, w.WardrobeError) as exc:
+        st.session_state["flash"] = ("err", str(exc))
+    st.rerun()
+
+
+def _sync_import_links(items: pd.DataFrame, output: Path) -> pd.DataFrame:
+    if not output.exists():
+        return items
+    try:
+        linked = pi.refresh_source_links(items, output)
+    except pi.PhotoImportError:
+        return items
+    if linked is not items:
+        try:
+            w.save_items(linked, w.ITEMS_PATH)
+        except w.WardrobeError as exc:
+            st.error(str(exc))
+            return items
+    return linked
+
+
+def _mention_unreadable(output: Path) -> None:
+    if not (output / pi.LIBRARY_NAME).is_file():
+        return
+    try:
+        state = pi.load_state(output)
+    except pi.PhotoImportError:
+        return
+    failed = [row for row in state["files"].values() if row.get("error")]
+    if failed:
+        noun = "photo" if len(failed) == 1 else "photos"
+        st.caption(f"{len(failed)} {noun} could not be read. Everything else was still scanned.")
+
+
+def _render_import_review(items: pd.DataFrame, outfits: pd.DataFrame, output: Path) -> None:
+    try:
+        pending = pi.pending_garments(output) if output.exists() else []
+    except pi.PhotoImportError as exc:
+        st.error(str(exc))
+        return
+    st.markdown(
+        """
+        <div class="page-intro">
+          <h2>Review</h2>
+          <p>Approve a piece to add it to the closet. Reject it and the crop is discarded. Originals stay put.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if not pending:
+        empty_block(
+            "Nothing waiting for review",
+            "Scan a photo folder. Suggestions show up here and stay out of the closet until you approve them.",
+        )
+        return
+    if st.button("Approve all as suggested", key="approve_all"):
+        _approve_all_pending(items, outfits, output, pending)
+    with st.container(key="import_review"):
+        for garment in pending:
+            _import_card(items, outfits, output, garment)
+
+
+def _import_card(items: pd.DataFrame, outfits: pd.DataFrame, output: Path, garment: dict) -> None:
+    garment_id = str(garment["id"])
+    name_key = f"imp_name_{garment_id}"
+    category_key = f"imp_cat_{garment_id}"
+    color_key = f"imp_color_{garment_id}"
+    season_key = f"imp_season_{garment_id}"
+    st.session_state.setdefault(name_key, str(garment.get("name") or ""))
+    category = str(garment.get("category") or w.CATEGORIES[0])
+    if category not in w.CATEGORIES:
+        category = w.CATEGORIES[0]
+    st.session_state.setdefault(category_key, category)
+    if st.session_state.get(category_key) not in w.CATEGORIES:
+        st.session_state[category_key] = category
+    color = str(garment.get("color") or w.COLORS[0])
+    if color not in w.COLORS:
+        color = w.COLORS[0]
+    st.session_state.setdefault(color_key, color)
+    if st.session_state.get(color_key) not in w.COLORS:
+        st.session_state[color_key] = color
+    season = str(garment.get("season") or "All")
+    if season not in w.SEASONS:
+        season = "All"
+    st.session_state.setdefault(season_key, season)
+    if st.session_state.get(season_key) not in w.SEASONS:
+        st.session_state[season_key] = season
+
+    with st.container(border=True):
+        photo, fields = st.columns([1, 2], gap="large")
+        with photo:
+            crop = Path(str(garment.get("crop_path") or ""))
+            if crop.is_file():
+                st.image(str(crop), width="stretch")
+            else:
+                swatch(str(garment.get("name") or "Piece"), str(garment.get("color") or "Beige"))
+            st.caption(_source_caption(garment))
+            note = _guess_note(garment)
+            if note:
+                st.caption(note)
+        with fields:
+            st.text_input("Name", max_chars=80, key=name_key)
+            st.selectbox("Category", w.CATEGORIES, key=category_key)
+            color_col, season_col = st.columns(2)
+            with color_col:
+                st.selectbox("Color", w.COLORS, key=color_key)
+            with season_col:
+                st.selectbox("Season", w.SEASONS, key=season_key)
+            approve, reject = st.columns(2)
+            with approve:
+                ok = st.button("Approve", type="primary", key=f"imp_ok_{garment_id}", width="stretch")
+            with reject:
+                no = st.button("Reject", key=f"imp_no_{garment_id}", width="stretch")
+    if ok:
+        _approve_one(
+            items,
+            outfits,
+            output,
+            garment_id,
+            name=str(st.session_state.get(name_key, "")),
+            category=str(st.session_state.get(category_key, "")),
+            color=str(st.session_state.get(color_key, "")),
+            season=str(st.session_state.get(season_key, "")),
+        )
+    if no:
+        _reject_one(output, garment_id)
+
+
+def _approve_one(
+    items: pd.DataFrame,
+    outfits: pd.DataFrame,
+    output: Path,
+    garment_id: str,
+    *,
+    name: str,
+    category: str,
+    color: str,
+    season: str,
+) -> None:
+    try:
+        updated, _outfits = pi.approve_garment(
+            output,
+            garment_id,
+            items,
+            outfits,
+            name=name,
+            category=category,
+            color=color,
+            season=season,
+        )
+        w.save_items(updated, w.ITEMS_PATH)
+    except (pi.PhotoImportError, w.WardrobeError) as exc:
+        st.session_state["flash"] = ("err", str(exc))
+    else:
+        st.session_state["flash"] = ("ok", f"Added {name.strip() or 'that piece'} to the closet.")
+    st.rerun()
+
+
+def _reject_one(output: Path, garment_id: str) -> None:
+    try:
+        pi.reject_garment(output, garment_id)
+    except pi.PhotoImportError as exc:
+        st.session_state["flash"] = ("err", str(exc))
+    else:
+        st.session_state["flash"] = ("ok", "Rejected. The original photo was left where it is.")
+    st.rerun()
+
+
+def _approve_all_pending(
+    items: pd.DataFrame,
+    outfits: pd.DataFrame,
+    output: Path,
+    pending: list[dict],
+) -> None:
+    added = 0
+    try:
+        for garment in pending:
+            garment_id = str(garment["id"])
+            category = str(st.session_state.get(f"imp_cat_{garment_id}", garment.get("category") or ""))
+            color = str(st.session_state.get(f"imp_color_{garment_id}", garment.get("color") or ""))
+            season = str(st.session_state.get(f"imp_season_{garment_id}", garment.get("season") or "All"))
+            name = str(st.session_state.get(f"imp_name_{garment_id}", garment.get("name") or ""))
+            items, outfits = pi.approve_garment(
+                output,
+                garment_id,
+                items,
+                outfits,
+                name=name,
+                category=category,
+                color=color,
+                season=season,
+            )
+            added += 1
+        w.save_items(items, w.ITEMS_PATH)
+    except (pi.PhotoImportError, w.WardrobeError) as exc:
+        if added:
+            w.save_items(items, w.ITEMS_PATH)
+        st.session_state["flash"] = ("err", str(exc))
+    else:
+        noun = "piece" if added == 1 else "pieces"
+        st.session_state["flash"] = ("ok", f"Added {added} {noun} to the closet.")
+    st.rerun()
+
+
+def _source_caption(garment: dict) -> str:
+    names = [Path(str(item)).name for item in garment.get("sources") or [] if str(item).strip()]
+    if not names:
+        return "Source photo unavailable."
+    shown = ", ".join(names[:3])
+    extra = len(names) - 3
+    if extra > 0:
+        shown += f" +{extra} more"
+    if len(names) == 1:
+        return f"From {shown}. The original stays where it is."
+    return f"Same piece in {shown}. The originals stay where they are."
+
+
+def _guess_note(garment: dict) -> str:
+    label = str(garment.get("label") or "").lower()
+    if label.startswith("upper") and garment.get("category") == "Outerwear":
+        return "Suggested as outerwear because the piece looks long. Change it if it is a shirt."
+    try:
+        confidence = float(garment.get("confidence") or 1)
+    except (TypeError, ValueError):
+        confidence = 1
+    if confidence < 0.6:
+        return "Best guess. Check the category before approving."
+    return ""
 
 
 def _clear_filters() -> None:
