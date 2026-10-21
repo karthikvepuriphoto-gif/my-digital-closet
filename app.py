@@ -6,7 +6,9 @@ Run it with: streamlit run app.py
 from __future__ import annotations
 
 import html
+from datetime import datetime
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -623,16 +625,28 @@ def chart(items: pd.DataFrame, column: str, value_name: str) -> None:
         .rename_axis(column)
         .reset_index(name=value_name)
     )
-    st.bar_chart(
-        counts,
-        x=column,
-        y=value_name,
-        horizontal=True,
-        sort=False,
-        color="primary",
-        x_label="",
-        y_label="",
+    top = max(int(counts[value_name].max()), 1)
+    spec = (
+        alt.Chart(counts)
+        .mark_bar(color="#24382d", cornerRadiusEnd=3)
+        .encode(
+            y=alt.Y(
+                f"{column}:N",
+                sort=alt.EncodingSortField(field=value_name, order="descending"),
+                title=None,
+                axis=alt.Axis(labelLimit=160),
+            ),
+            x=alt.X(
+                f"{value_name}:Q",
+                title=None,
+                scale=alt.Scale(domain=[0, top + 1], nice=False),
+                axis=alt.Axis(tickMinStep=1, values=list(range(0, top + 1))),
+            ),
+            tooltip=[alt.Tooltip(column, title=column), alt.Tooltip(value_name, title=value_name)],
+        )
+        .properties(height=max(36 * len(counts) + 24, 120))
     )
+    st.altair_chart(spec, width="stretch")
 
 
 def piece_select(
@@ -904,11 +918,22 @@ def meta_line(row: pd.Series) -> str:
 
 
 def look_meta(outfit: pd.Series, pieces: list[tuple[str, pd.Series]]) -> str:
-    created = str(outfit["Created"]).strip()
+    created = format_created(str(outfit["Created"]))
     names = ", ".join(str(row["Sub-Category"]) for _, row in pieces) or "No pieces left"
     if created:
         return f"{names} · {created}"
     return names
+
+
+def format_created(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return text
+    return f"{parsed.strftime('%b')} {parsed.day}, {parsed.year}"
 
 
 def swatch_color(color: str) -> str:
